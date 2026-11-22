@@ -1,6 +1,6 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ask, open } from "@tauri-apps/plugin-dialog";
-import { api, type ItemView, type SearchHit, type SpaceSummary, type SpaceView } from "./api";
+import { api, type ItemView, type Probe, type SearchHit, type SpaceHealth, type SpaceSummary, type SpaceView } from "./api";
 
 const COLORS = ["#4f7cff", "#16a37f", "#e2683c", "#a35bd6", "#d4a017", "#d6457a", "#2e9bc4", "#6b7a8f"];
 
@@ -19,7 +19,13 @@ const state = {
   dropTarget: null as string | null,
   selected: new Set<string>(),
   anchor: null as string | null,
+  /** File-system state per path; filled asynchronously so the UI never waits on slow shares. */
+  probes: new Map<string, Probe>(),
+  health: new Map<string, SpaceHealth>(),
 };
+
+type ItemStatus = Probe["status"] | "unknown";
+const statusOf = (i: ItemView): ItemStatus => state.probes.get(i.path)?.status ?? "unknown";
 
 const app = document.getElementById("app")!;
 
@@ -95,6 +101,27 @@ async function refresh() {
   }
   if (state.globalQuery) state.hits = (await guard(api.search(state.globalQuery))) ?? [];
   render();
+  void probeVisible();
+  void loadHealth();
+}
+
+let probeSeq = 0;
+/** Checks existence/size/date of the visible items in the background. */
+async function probeVisible() {
+  const paths = [...new Set([...(state.current?.items ?? []), ...state.hits.map((h) => h.item)].map((i) => i.path))];
+  if (!paths.length) return;
+  const seq = ++probeSeq;
+  const res = await guard(api.probe(paths));
+  if (!res || seq !== probeSeq) return;
+  res.forEach((p) => state.probes.set(p.path, p));
+  render();
+}
+
+async function loadHealth() {
+  const res = await guard(api.spaceHealth());
+  if (!res) return;
+  state.health = new Map(res.map((h) => [h.spaceId, h]));
+  render();
 }
 
 async function selectSpace(id: string) {
@@ -111,6 +138,7 @@ async function selectSpace(id: string) {
     /* storage unavailable */
   }
   render();
+  void probeVisible();
 }
 
 async function addToSpace(spaceId: string, paths: string[]) {
@@ -121,7 +149,8 @@ async function addToSpace(spaceId: string, paths: string[]) {
   const parts = [`${res.added} hinzugefügt zu „${name}“`];
   if (res.duplicates) parts.push(`${res.duplicates} bereits vorhanden`);
   if (res.missing.length) parts.push(`${res.missing.length} nicht gefunden`);
-  toast(parts.join(" · "), res.missing.length ? "err" : "ok");
+  if (res.offline.length) parts.push(`${res.offline.length} auf nicht erreichbarer Netzwerkfreigabe`);
+  toast(parts.join(" · "), res.missing.length || res.offline.length ? "err" : "ok");
   if (state.current?.id !== spaceId) await selectSpace(spaceId);
   await refresh();
 }
@@ -140,8 +169,9 @@ async function copyFiles(paths: string[]) {
   const what = res.copied === 1 ? "1 Element" : `${res.copied} Elemente`;
   toast(
     `${what} in die Zwischenablage kopiert. Mit Strg+V einfügen.` +
-      (res.missing ? ` (${res.missing} nicht gefunden, übersprungen)` : ""),
-    res.missing ? "err" : "ok",
+      (res.missing ? ` ${res.missing} nicht gefunden, übersprungen.` : "") +
+      (res.offline ? ` ${res.offline} offline (Netzwerk), übersprungen.` : ""),
+    res.missing || res.offline ? "err" : "ok",
   );
 }
 
@@ -188,10 +218,18 @@ function sortedItems(items: ItemView[]): ItemView[] {
     added: (a, b) => b.addedAt - a.addedAt,
     name: (a, b) => name(a).localeCompare(name(b), "de"),
     location: (a, b) => a.location.localeCompare(b.location, "de") || name(a).localeCompare(name(b), "de"),
-    modified: (a, b) => (b.modified ?? 0) - (a.modified ?? 0),
+    modified: (a, b) => (state.probes.get(b.path)?.modified ?? 0) - (state.probes.get(a.path)?.modified ?? 0),
   };
   // Folders first, then the chosen order.
   return list.sort((a, b) => (a.kind === b.kind ? cmp[state.sort](a, b) : a.kind === "folder" ? -1 : 1));
+}
+
+function healthBadges(h: SpaceHealth | undefined): string {
+  if (!h) return "";
+  return (
+    (h.offline ? `<span class="offline-badge" title="${h.offline} auf nicht erreichbarer Netzwerkfreigabe">${svg("offline")}</span>` : "") +
+    (h.missing ? `<span class="warn" title="${h.missing} Verknüpfung(en) nicht gefunden">!</span>` : "")
+  );
 }
 
 function renderSidebar(): string {
@@ -203,7 +241,7 @@ function renderSidebar(): string {
                 data-action="select" data-id="${s.id}" data-drop-space="${s.id}">
           <span class="dot" style="background:${esc(s.color)}"></span>
           <span class="space-name">${esc(s.name)}</span>
-          ${s.missingCount ? `<span class="warn" title="${s.missingCount} Verknüpfung(en) nicht gefunden">!</span>` : ""}
+          ${healthBadges(state.health.get(s.id))}
           <span class="count">${s.itemCount}</span>
         </button>
       </li>`,
@@ -232,14 +270,9 @@ function renderSidebar(): string {
 function renderItem(i: ItemView): string {
   const editing = state.editingItem === i.id;
   const title = i.label ?? i.name;
-  const meta = [
-    i.kind === "file" ? fmtSize(i.size) : "Ordner",
-    i.modified ? `geändert ${fmtDate(i.modified)}` : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  const st = statusOf(i);
   return `
-    <li class="item selectable ${i.exists ? "" : "missing"} ${state.selected.has(i.id) ? "selected" : ""}" data-id="${i.id}" data-path="${esc(i.path)}">
+    <li class="item selectable ${st} ${state.selected.has(i.id) ? "selected" : ""}" data-id="${i.id}" data-path="${esc(i.path)}">
       ${iconFor(i)}
       <div class="item-body">
         ${
@@ -254,18 +287,18 @@ function renderItem(i: ItemView): string {
                </form>`
             : `<div class="item-title" title="${esc(i.path)}">${esc(title)}${i.label ? ` <span class="orig">${esc(i.name)}</span>` : ""}</div>
                <div class="item-path">
-                 <span class="loc">${esc(i.location)}</span>
-                 <span class="parent" title="${esc(i.parent)}">${esc(i.parent)}</span>
+                 ${locChip(i)}
+                 <span class="parent" title="${esc(i.parent)}"><bdi dir="ltr">${esc(i.parent)}</bdi></span>
                </div>
                ${i.note ? `<div class="item-note">${esc(i.note)}</div>` : ""}`
         }
       </div>
       <div class="item-meta">
-        ${i.exists ? esc(meta) : `<span class="missing-badge">Nicht gefunden</span>`}
+        ${metaFor(i)}
       </div>
       <div class="item-actions">
         ${
-          i.exists
+          st !== "missing"
             ? `<button class="icon-btn" data-action="open" title="Öffnen">${svg("open")}</button>
                <button class="icon-btn" data-action="copy" title="In Zwischenablage kopieren (Strg+C)">${svg("copy")}</button>
                <button class="icon-btn" data-action="reveal" title="Im Explorer zeigen">${svg("reveal")}</button>`
@@ -277,13 +310,37 @@ function renderItem(i: ItemView): string {
     </li>`;
 }
 
-function svg(name: "open" | "reveal" | "edit" | "remove" | "trash" | "copy"): string {
+function locChip(i: ItemView): string {
+  return `<span class="loc ${i.network ? "net" : ""}" title="${esc(i.location)}">${i.network ? svg("network") : ""}<span class="loc-text">${esc(i.location)}</span></span>`;
+}
+
+function metaFor(i: ItemView): string {
+  const p = state.probes.get(i.path);
+  switch (p?.status) {
+    case undefined:
+      return `<span class="pending" title="Wird geprüft…">…</span>`;
+    case "missing":
+      return `<span class="missing-badge">Nicht gefunden</span>`;
+    case "offline":
+      return `<span class="offline-text" title="Die Netzwerkfreigabe antwortet nicht. Die Datei ist vermutlich noch da.">${svg("offline")} Offline</span>`;
+    case "ok":
+      return esc(
+        [i.kind === "file" ? fmtSize(p.size) : "Ordner", p.modified ? `geändert ${fmtDate(p.modified)}` : ""]
+          .filter(Boolean)
+          .join(" · "),
+      );
+  }
+}
+
+function svg(name: "open" | "reveal" | "edit" | "remove" | "trash" | "copy" | "network" | "offline"): string {
   const paths = {
     open: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
     reveal: "M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1zM10 13h6M13 10l3 3-3 3",
     edit: "M4 20h4L19 9l-4-4L4 16zM14 6l4 4",
     remove: "M6 6l12 12M18 6L6 18",
     copy: "M9 9h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V10a1 1 0 0 1 1-1zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1",
+    network: "M12 3v6M5 21h14M12 15v6M4 9h16v6H4z",
+    offline: "M3 3l18 18M8.5 8.5A5 5 0 0 0 7 18h10M17.7 13.1A4 4 0 0 0 12.6 8M10 5.3A6 6 0 0 1 18 10",
     trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
   };
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[name]}"/></svg>`;
@@ -291,7 +348,8 @@ function svg(name: "open" | "reveal" | "edit" | "remove" | "trash" | "copy"): st
 
 function renderSpace(s: SpaceView): string {
   const items = sortedItems(s.items);
-  const missing = s.items.filter((i) => !i.exists).length;
+  const missing = s.items.filter((i) => statusOf(i) === "missing").length;
+  const offline = s.items.filter((i) => statusOf(i) === "offline").length;
   const locations = [...new Set(s.items.map((i) => i.location))];
   return `
     <header class="space-header">
@@ -308,6 +366,7 @@ function renderSpace(s: SpaceView): string {
       <span>${s.items.length} Verknüpfung${s.items.length === 1 ? "" : "en"}</span>
       ${locations.length ? `<span>aus ${locations.map(esc).join(", ")}</span>` : ""}
       ${missing ? `<span class="warn-text">${missing} nicht gefunden</span>` : ""}
+      ${offline ? `<span class="offline-text">${offline} offline (Netzwerkfreigabe nicht erreichbar)</span>` : ""}
     </div>
     ${
       s.items.length
@@ -354,17 +413,17 @@ function renderSearch(): string {
   const rows = state.hits
     .map(
       (h) => `
-      <li class="item hit ${h.item.exists ? "" : "missing"}" data-id="${h.item.id}" data-path="${esc(h.item.path)}" data-space="${h.spaceId}">
+      <li class="item hit ${statusOf(h.item)}" data-id="${h.item.id}" data-path="${esc(h.item.path)}" data-space="${h.spaceId}">
         ${iconFor(h.item)}
         <div class="item-body">
           <div class="item-title">${esc(h.item.label ?? h.item.name)}</div>
-          <div class="item-path"><span class="loc">${esc(h.item.location)}</span><span class="parent">${esc(h.item.parent)}</span></div>
+          <div class="item-path">${locChip(h.item)}<span class="parent" title="${esc(h.item.parent)}"><bdi dir="ltr">${esc(h.item.parent)}</bdi></span></div>
         </div>
         <button class="space-chip" data-action="goto-space" data-id="${h.spaceId}">
           <span class="dot" style="background:${esc(h.spaceColor)}"></span>${esc(h.spaceName)}
         </button>
         <div class="item-actions">
-          ${h.item.exists ? `<button class="icon-btn" data-action="open" title="Öffnen">${svg("open")}</button>
+          ${statusOf(h.item) !== "missing" ? `<button class="icon-btn" data-action="open" title="Öffnen">${svg("open")}</button>
           <button class="icon-btn" data-action="copy" title="In Zwischenablage kopieren">${svg("copy")}</button>
           <button class="icon-btn" data-action="reveal" title="Im Explorer zeigen">${svg("reveal")}</button>` : ""}
         </div>

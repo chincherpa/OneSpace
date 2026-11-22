@@ -144,6 +144,18 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .item-note { font-size: 12.5px; margin-top: 4px; white-space: pre-wrap; }
 .item-meta { color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }
 .missing-badge { color: var(--warn); font-weight: 600; }
+.offline-text { color: var(--muted); font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
+.offline-text svg, .offline-badge svg, .loc svg {
+  width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+.offline-badge { color: var(--muted); display: grid; place-items: center; }
+.item.offline .item-title { color: var(--muted); }
+.item.offline .icon { opacity: .55; }
+.pending { color: var(--muted); }
+.loc { display: inline-flex; align-items: center; gap: 4px; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.loc svg { flex: none; }
+.loc-text { overflow: hidden; text-overflow: ellipsis; }
+.loc.net { background: color-mix(in srgb, var(--muted) 18%, transparent); color: var(--text); }
 .item-actions { display: flex; gap: 2px; opacity: .55; }
 .item:hover .item-actions { opacity: 1; }
 .no-match { padding: 24px; color: var(--muted); text-align: center; }

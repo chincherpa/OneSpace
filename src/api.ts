@@ -7,7 +7,6 @@ export interface SpaceSummary {
   name: string;
   color: string;
   itemCount: number;
-  missingCount: number;
 }
 
 export interface ItemView {
@@ -18,11 +17,9 @@ export interface ItemView {
   label: string | null;
   note: string;
   addedAt: number;
-  exists: boolean;
-  size: number | null;
-  modified: number | null;
   extension: string;
   location: string;
+  network: boolean;
   parent: string;
 }
 
@@ -39,6 +36,23 @@ export interface AddResult {
   added: number;
   duplicates: number;
   missing: string[];
+  offline: string[];
+}
+
+export type Status = "ok" | "missing" | "offline";
+
+export interface Probe {
+  path: string;
+  status: Status;
+  isDir: boolean;
+  size: number | null;
+  modified: number | null;
+}
+
+export interface SpaceHealth {
+  spaceId: string;
+  missing: number;
+  offline: number;
 }
 
 export interface SearchHit {
@@ -51,6 +65,7 @@ export interface SearchHit {
 export interface CopyResult {
   copied: number;
   missing: number;
+  offline: number;
 }
 
 export const api = {
@@ -67,6 +82,8 @@ export const api = {
   relinkItem: (spaceId: string, itemId: string, newPath: string) =>
     invoke<void>("relink_item", { spaceId, itemId, newPath }),
   search: (query: string) => invoke<SearchHit[]>("search", { query }),
+  probe: (paths: string[]) => invoke<Probe[]>("probe", { paths }),
+  spaceHealth: () => invoke<SpaceHealth[]>("space_health"),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   copyFiles: (paths: string[]) => invoke<CopyResult>("copy_files", { paths }),

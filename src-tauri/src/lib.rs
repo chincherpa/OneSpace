@@ -1,12 +1,12 @@
 mod clipboard;
+mod net;
 mod store;
 
+use net::{Probe, Status};
 use serde::Serialize;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
-use store::{kind_of, now_ms, Error, Item, Kind, Result, Space, Store};
+use std::sync::{Mutex, OnceLock};
+use store::{now_ms, Error, Item, Kind, Result, Space, Store};
 use tauri::{Manager, State};
 
 type AppStore = Mutex<Store>;
@@ -15,7 +15,10 @@ const PALETTE: &[&str] = &[
     "#4f7cff", "#16a37f", "#e2683c", "#a35bd6", "#d4a017", "#d6457a", "#2e9bc4", "#6b7a8f",
 ];
 
-// ---------- view models (computed from the file system on demand) ----------
+// ---------- view models ----------
+// Views are built from the stored map only. Anything that touches the file system
+// (existence, size, date) goes through `probe`, which runs off the main thread and
+// cannot hang on unreachable network shares.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,7 +27,6 @@ struct SpaceSummary {
     name: String,
     color: String,
     item_count: usize,
-    missing_count: usize,
 }
 
 #[derive(Serialize)]
@@ -37,12 +39,10 @@ struct ItemView {
     label: Option<String>,
     note: String,
     added_at: u64,
-    exists: bool,
-    size: Option<u64>,
-    modified: Option<u64>,
     extension: String,
-    /// Human readable origin, e.g. "Dokumente", "Downloads", "OneDrive".
+    /// Human readable origin, e.g. "Dokumente", "OneDrive", "Netzwerk · nas\projekte".
     location: String,
+    network: bool,
     parent: String,
 }
 
@@ -63,6 +63,7 @@ struct AddResult {
     added: usize,
     duplicates: usize,
     missing: Vec<String>,
+    offline: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -74,57 +75,78 @@ struct SearchHit {
     item: ItemView,
 }
 
-fn known_locations() -> Vec<(String, PathBuf)> {
-    let mut v: Vec<(String, PathBuf)> = Vec::new();
-    // OneDrive first: Documents/Desktop are often redirected into it.
-    for var in ["OneDriveCommercial", "OneDriveConsumer", "OneDrive"] {
-        if let Ok(p) = std::env::var(var) {
-            v.push(("OneDrive".into(), PathBuf::from(p)));
-        }
-    }
-    let dirs = [
-        ("Dokumente", dirs::document_dir()),
-        ("Downloads", dirs::download_dir()),
-        ("Desktop", dirs::desktop_dir()),
-        ("Bilder", dirs::picture_dir()),
-        ("Musik", dirs::audio_dir()),
-        ("Videos", dirs::video_dir()),
-    ];
-    for (name, dir) in dirs {
-        if let Some(d) = dir {
-            v.push((name.into(), d));
-        }
-    }
-    if let Some(h) = dirs::home_dir() {
-        v.push(("Benutzerordner".into(), h));
-    }
-    // Most specific (longest) match wins.
-    v.sort_by_key(|(_, p)| std::cmp::Reverse(p.as_os_str().len()));
-    v
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpaceHealth {
+    space_id: String,
+    missing: usize,
+    offline: usize,
 }
 
-fn location_of(path: &Path, known: &[(String, PathBuf)]) -> String {
-    let key = store::path_key(&path.to_string_lossy());
-    for (name, dir) in known {
-        let dk = store::path_key(&dir.to_string_lossy());
-        if key.starts_with(&dk) && key.len() > dk.len() {
-            return name.clone();
-        }
-    }
-    // Fall back to the drive (Windows) or the top-level folder.
-    path.components()
-        .next()
-        .map(|c| c.as_os_str().to_string_lossy().trim_end_matches(['\\', ':']).to_string() + ":")
-        .unwrap_or_default()
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CopyResult {
+    copied: usize,
+    missing: usize,
+    offline: usize,
 }
 
-fn view_item(item: &Item, known: &[(String, PathBuf)]) -> ItemView {
+fn known_locations() -> &'static [(String, String)] {
+    static KNOWN: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let mut v: Vec<(String, PathBuf)> = Vec::new();
+        for var in ["OneDriveCommercial", "OneDriveConsumer", "OneDrive"] {
+            if let Ok(p) = std::env::var(var) {
+                v.push(("OneDrive".into(), PathBuf::from(p)));
+            }
+        }
+        let dirs = [
+            ("Dokumente", dirs::document_dir()),
+            ("Downloads", dirs::download_dir()),
+            ("Desktop", dirs::desktop_dir()),
+            ("Bilder", dirs::picture_dir()),
+            ("Musik", dirs::audio_dir()),
+            ("Videos", dirs::video_dir()),
+            ("Benutzerordner", dirs::home_dir()),
+        ];
+        v.extend(dirs.into_iter().filter_map(|(n, d)| d.map(|d| (n.to_string(), d))));
+        // Compare on canonical keys; most specific (longest) match wins.
+        let mut keyed: Vec<(String, String)> = v
+            .into_iter()
+            .map(|(n, d)| (n, net::path_key(&d.to_string_lossy())))
+            .collect();
+        keyed.sort_by_key(|(_, k)| std::cmp::Reverse(k.len()));
+        keyed
+    })
+}
+
+/// Returns (label, is_network).
+fn location_of(path: &str) -> (String, bool) {
+    let key = net::path_key(path);
+    let root = net::net_root(path);
+    for (name, dir) in known_locations() {
+        // Known folders such as Documents may be redirected to a share; the folder name wins.
+        if key.len() > dir.len() && key.starts_with(dir.as_str()) && key.as_bytes()[dir.len()] == b'\\' {
+            return (name.clone(), root.is_some());
+        }
+    }
+    if let Some(r) = root {
+        return (format!("Netzwerk · {}", r.display()), true);
+    }
+    let p = net::normalize(path);
+    match p.as_bytes() {
+        [d, b':', ..] if d.is_ascii_alphabetic() => (format!("Laufwerk {}:", (*d as char).to_ascii_uppercase()), false),
+        _ => (p.split('\\').find(|s| !s.is_empty()).unwrap_or_default().to_string(), false),
+    }
+}
+
+fn view_item(item: &Item) -> ItemView {
     let p = Path::new(&item.path);
-    let meta = fs::metadata(p).ok();
     let name = p
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| item.path.clone());
+    let (location, network) = location_of(&item.path);
     ItemView {
         id: item.id.clone(),
         path: item.path.clone(),
@@ -133,18 +155,12 @@ fn view_item(item: &Item, known: &[(String, PathBuf)]) -> ItemView {
         label: item.label.clone(),
         note: item.note.clone(),
         added_at: item.added_at,
-        exists: meta.is_some(),
-        size: meta.as_ref().filter(|m| m.is_file()).map(|m| m.len()),
-        modified: meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64),
         extension: p
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default(),
-        location: location_of(p, known),
+        location,
+        network,
         parent: p.parent().map(|x| x.display().to_string()).unwrap_or_default(),
     }
 }
@@ -155,7 +171,6 @@ fn summary(s: &Space) -> SpaceSummary {
         name: s.name.clone(),
         color: s.color.clone(),
         item_count: s.items.len(),
-        missing_count: s.items.iter().filter(|i| !Path::new(&i.path).exists()).count(),
     }
 }
 
@@ -163,7 +178,14 @@ fn lock<'a>(st: &'a State<AppStore>) -> Result<std::sync::MutexGuard<'a, Store>>
     st.lock().map_err(|_| Error::Other("store lock poisoned".into()))
 }
 
-// ---------- commands ----------
+/// Runs blocking work (file system, shell) on a worker thread.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::Other(e.to_string()))
+}
+
+// ---------- commands: map ----------
 
 #[tauri::command]
 fn list_spaces(st: State<AppStore>) -> Result<Vec<SpaceSummary>> {
@@ -174,14 +196,13 @@ fn list_spaces(st: State<AppStore>) -> Result<Vec<SpaceSummary>> {
 fn get_space(st: State<AppStore>, id: String) -> Result<SpaceView> {
     let store = lock(&st)?;
     let s = store.space(&id)?;
-    let known = known_locations();
     Ok(SpaceView {
         id: s.id.clone(),
         name: s.name.clone(),
         description: s.description.clone(),
         color: s.color.clone(),
         created_at: s.created_at,
-        items: s.items.iter().map(|i| view_item(i, &known)).collect(),
+        items: s.items.iter().map(view_item).collect(),
     })
 }
 
@@ -246,32 +267,31 @@ fn delete_space(st: State<AppStore>, id: String) -> Result<()> {
 
 /// Adds references to the given paths. Nothing on disk is moved or copied.
 #[tauri::command]
-fn add_paths(st: State<AppStore>, space_id: String, paths: Vec<String>) -> Result<AddResult> {
+async fn add_paths(st: State<'_, AppStore>, space_id: String, paths: Vec<String>) -> Result<AddResult> {
+    let paths: Vec<String> = paths.iter().map(|p| net::normalize(p)).collect();
+    let probes = blocking(move || net::probe_all(&paths)).await?;
+
     let mut store = lock(&st)?;
     let s = store.space_mut(&space_id)?;
-    let mut res = AddResult { added: 0, duplicates: 0, missing: vec![] };
-    for raw in paths {
-        let p = PathBuf::from(&raw);
-        let kind = match kind_of(&p) {
-            Ok(k) => k,
-            Err(_) => {
-                res.missing.push(raw);
-                continue;
+    let mut res = AddResult { added: 0, duplicates: 0, missing: vec![], offline: vec![] };
+    let mut keys: std::collections::HashSet<String> = s.items.iter().map(|i| net::path_key(&i.path)).collect();
+    for p in probes {
+        match p.status {
+            Status::Missing => res.missing.push(p.path),
+            Status::Offline => res.offline.push(p.path),
+            Status::Ok if !keys.insert(net::path_key(&p.path)) => res.duplicates += 1,
+            Status::Ok => {
+                s.items.push(Item {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    kind: if p.is_dir { Kind::Folder } else { Kind::File },
+                    path: p.path,
+                    label: None,
+                    note: String::new(),
+                    added_at: now_ms(),
+                });
+                res.added += 1;
             }
-        };
-        if s.contains_path(&raw) {
-            res.duplicates += 1;
-            continue;
         }
-        s.items.push(Item {
-            id: uuid::Uuid::new_v4().to_string(),
-            path: raw,
-            kind,
-            label: None,
-            note: String::new(),
-            added_at: now_ms(),
-        });
-        res.added += 1;
     }
     if res.added > 0 {
         store.save()?;
@@ -313,12 +333,17 @@ fn update_item(
 
 /// Points an item at a new location after the original was moved or renamed.
 #[tauri::command]
-fn relink_item(st: State<AppStore>, space_id: String, item_id: String, new_path: String) -> Result<()> {
-    let kind = kind_of(Path::new(&new_path))?;
+async fn relink_item(st: State<'_, AppStore>, space_id: String, item_id: String, new_path: String) -> Result<()> {
+    let new_path = net::normalize(&new_path);
+    let p = new_path.clone();
+    let probe = blocking(move || net::probe_all(&[p]).remove(0)).await?;
+    if probe.status != Status::Ok {
+        return Err(Error::PathMissing(new_path));
+    }
     let mut store = lock(&st)?;
     let item = store.space_mut(&space_id)?.item_mut(&item_id)?;
     item.path = new_path;
-    item.kind = kind;
+    item.kind = if probe.is_dir { Kind::Folder } else { Kind::File };
     store.save()
 }
 
@@ -330,7 +355,6 @@ fn search(st: State<AppStore>, query: String) -> Result<Vec<SearchHit>> {
         return Ok(vec![]);
     }
     let store = lock(&st)?;
-    let known = known_locations();
     let mut hits = vec![];
     for s in &store.data.spaces {
         for i in &s.items {
@@ -345,7 +369,7 @@ fn search(st: State<AppStore>, query: String) -> Result<Vec<SearchHit>> {
                     space_id: s.id.clone(),
                     space_name: s.name.clone(),
                     space_color: s.color.clone(),
-                    item: view_item(i, &known),
+                    item: view_item(i),
                 });
             }
         }
@@ -353,23 +377,64 @@ fn search(st: State<AppStore>, query: String) -> Result<Vec<SearchHit>> {
     Ok(hits)
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CopyResult {
-    copied: usize,
-    missing: usize,
+// ---------- commands: file system (never on the main thread) ----------
+
+/// Existence, size and date for the given paths. Unreachable shares yield `offline` quickly.
+#[tauri::command]
+async fn probe(paths: Vec<String>) -> Result<Vec<Probe>> {
+    blocking(move || net::probe_all(&paths)).await
+}
+
+/// Missing/offline counts per space, for the sidebar.
+#[tauri::command]
+async fn space_health(st: State<'_, AppStore>) -> Result<Vec<SpaceHealth>> {
+    let spaces: Vec<(String, Vec<String>)> = lock(&st)?
+        .data
+        .spaces
+        .iter()
+        .map(|s| (s.id.clone(), s.items.iter().map(|i| i.path.clone()).collect()))
+        .collect();
+    blocking(move || {
+        let all: Vec<String> = spaces.iter().flat_map(|(_, p)| p.iter().cloned()).collect();
+        let mut probes = net::probe_all(&all).into_iter();
+        spaces
+            .into_iter()
+            .map(|(id, paths)| {
+                let mut h = SpaceHealth { space_id: id, missing: 0, offline: 0 };
+                for p in probes.by_ref().take(paths.len()) {
+                    match p.status {
+                        Status::Missing => h.missing += 1,
+                        Status::Offline => h.offline += 1,
+                        Status::Ok => {}
+                    }
+                }
+                h
+            })
+            .collect()
+    })
+    .await
 }
 
 /// Copies the referenced files/folders themselves to the clipboard (paste with Ctrl+V in Explorer).
-/// Missing originals are skipped.
+/// Missing originals and those on unreachable shares are skipped.
 #[tauri::command]
-fn copy_files(paths: Vec<String>) -> Result<CopyResult> {
-    let (ok, missing): (Vec<String>, Vec<String>) = paths.into_iter().partition(|p| Path::new(p).exists());
-    if ok.is_empty() {
-        return Err(Error::Other("Keine der gewählten Dateien ist auffindbar".into()));
-    }
-    clipboard::set_files(&ok).map_err(Error::Other)?;
-    Ok(CopyResult { copied: ok.len(), missing: missing.len() })
+async fn copy_files(paths: Vec<String>) -> Result<CopyResult> {
+    blocking(move || {
+        let probes = net::probe_all(&paths);
+        let ok: Vec<String> = probes.iter().filter(|p| p.status == Status::Ok).map(|p| p.path.clone()).collect();
+        let count = |s| probes.iter().filter(|p| p.status == s).count();
+        let res = CopyResult { copied: ok.len(), missing: count(Status::Missing), offline: count(Status::Offline) };
+        if ok.is_empty() {
+            return Err(Error::Other(if res.offline > 0 {
+                "Die Netzwerkfreigabe ist nicht erreichbar".into()
+            } else {
+                "Keine der gewählten Dateien ist auffindbar".into()
+            }));
+        }
+        clipboard::set_files(&ok).map_err(Error::Other)?;
+        Ok(res)
+    })
+    .await?
 }
 
 /// Copies the full paths as text, one per line.
@@ -379,13 +444,15 @@ fn copy_paths(paths: Vec<String>) -> Result<()> {
 }
 
 #[tauri::command]
-fn open_path(path: String) -> Result<()> {
-    tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| Error::Other(e.to_string()))
+async fn open_path(path: String) -> Result<()> {
+    blocking(move || tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| Error::Other(e.to_string())))
+        .await?
 }
 
 #[tauri::command]
-fn reveal_path(path: String) -> Result<()> {
-    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|e| Error::Other(e.to_string()))
+async fn reveal_path(path: String) -> Result<()> {
+    blocking(move || tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|e| Error::Other(e.to_string())))
+        .await?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -409,9 +476,11 @@ pub fn run() {
             update_item,
             relink_item,
             search,
-            open_path,
+            probe,
+            space_health,
             copy_files,
             copy_paths,
+            open_path,
             reveal_path
         ])
         .run(tauri::generate_context!())

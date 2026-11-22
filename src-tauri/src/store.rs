@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, thiserror::Error)]
@@ -78,16 +78,6 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Case-insensitive comparison key on Windows, exact elsewhere.
-pub fn path_key(p: &str) -> String {
-    let trimmed = p.trim_end_matches(['\\', '/']);
-    if cfg!(windows) {
-        trimmed.replace('/', "\\").to_lowercase()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 pub struct Store {
     file: PathBuf,
     pub data: Data,
@@ -127,16 +117,6 @@ impl Space {
     pub fn item_mut(&mut self, id: &str) -> Result<&mut Item> {
         self.items.iter_mut().find(|i| i.id == id).ok_or(Error::ItemNotFound)
     }
-
-    pub fn contains_path(&self, path: &str) -> bool {
-        let key = path_key(path);
-        self.items.iter().any(|i| path_key(&i.path) == key)
-    }
-}
-
-pub fn kind_of(path: &Path) -> Result<Kind> {
-    let meta = fs::metadata(path).map_err(|_| Error::PathMissing(path.display().to_string()))?;
-    Ok(if meta.is_dir() { Kind::Folder } else { Kind::File })
 }
 
 #[cfg(test)]
@@ -166,7 +146,7 @@ mod tests {
         store.save().unwrap();
         let loaded = Store::load(file).unwrap();
         assert_eq!(loaded.data.spaces.len(), 1);
-        assert!(loaded.data.spaces[0].contains_path("C:\\Users\\a\\Documents\\x.xlsx"));
+        assert_eq!(loaded.data.spaces[0].items[0].path, "C:\\Users\\a\\Documents\\x.xlsx");
         fs::remove_dir_all(dir).ok();
     }
 }
