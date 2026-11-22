@@ -17,6 +17,8 @@ const state = {
   creating: false,
   dragging: false,
   dropTarget: null as string | null,
+  selected: new Set<string>(),
+  anchor: null as string | null,
 };
 
 const app = document.getElementById("app")!;
@@ -99,6 +101,8 @@ async function selectSpace(id: string) {
   state.current = (await guard(api.getSpace(id))) ?? null;
   state.filter = "";
   state.editingItem = null;
+  state.selected.clear();
+  state.anchor = null;
   state.globalQuery = "";
   state.hits = [];
   try {
@@ -127,6 +131,49 @@ async function pickAndAdd(directory: boolean) {
   const sel = await open({ multiple: true, directory, title: directory ? "Ordner verknüpfen" : "Dateien verknüpfen" });
   if (!sel) return;
   await addToSpace(state.current.id, Array.isArray(sel) ? sel : [sel]);
+}
+
+async function copyFiles(paths: string[]) {
+  if (!paths.length) return;
+  const res = await guard(api.copyFiles(paths));
+  if (!res) return;
+  const what = res.copied === 1 ? "1 Element" : `${res.copied} Elemente`;
+  toast(
+    `${what} in die Zwischenablage kopiert. Mit Strg+V einfügen.` +
+      (res.missing ? ` (${res.missing} nicht gefunden, übersprungen)` : ""),
+    res.missing ? "err" : "ok",
+  );
+}
+
+async function copyPaths(paths: string[]) {
+  if (!paths.length) return;
+  if ((await guard(api.copyPaths(paths))) === undefined) return;
+  toast(paths.length === 1 ? "Pfad kopiert." : `${paths.length} Pfade kopiert.`);
+}
+
+/** Paths of the selection, in the order shown. */
+function selectedPaths(): string[] {
+  if (!state.current) return [];
+  return sortedItems(state.current.items)
+    .filter((i) => state.selected.has(i.id))
+    .map((i) => i.path);
+}
+
+function selectRow(id: string, ev: MouseEvent) {
+  const visible = state.current ? sortedItems(state.current.items).map((i) => i.id) : [];
+  if (ev.shiftKey && state.anchor && visible.includes(state.anchor)) {
+    const [a, b] = [visible.indexOf(state.anchor), visible.indexOf(id)].sort((x, y) => x - y);
+    if (!ev.ctrlKey) state.selected.clear();
+    visible.slice(a, b + 1).forEach((x) => state.selected.add(x));
+  } else if (ev.ctrlKey || ev.metaKey) {
+    if (state.selected.has(id)) state.selected.delete(id);
+    else state.selected.add(id);
+    state.anchor = id;
+  } else {
+    state.selected = new Set([id]);
+    state.anchor = id;
+  }
+  render();
 }
 
 // ---------- rendering ----------
@@ -192,7 +239,7 @@ function renderItem(i: ItemView): string {
     .filter(Boolean)
     .join(" · ");
   return `
-    <li class="item ${i.exists ? "" : "missing"}" data-id="${i.id}" data-path="${esc(i.path)}">
+    <li class="item selectable ${i.exists ? "" : "missing"} ${state.selected.has(i.id) ? "selected" : ""}" data-id="${i.id}" data-path="${esc(i.path)}">
       ${iconFor(i)}
       <div class="item-body">
         ${
@@ -220,6 +267,7 @@ function renderItem(i: ItemView): string {
         ${
           i.exists
             ? `<button class="icon-btn" data-action="open" title="Öffnen">${svg("open")}</button>
+               <button class="icon-btn" data-action="copy" title="In Zwischenablage kopieren (Strg+C)">${svg("copy")}</button>
                <button class="icon-btn" data-action="reveal" title="Im Explorer zeigen">${svg("reveal")}</button>`
             : `<button class="btn small" data-action="relink" title="Neuen Speicherort wählen">Neu verknüpfen</button>`
         }
@@ -229,12 +277,13 @@ function renderItem(i: ItemView): string {
     </li>`;
 }
 
-function svg(name: "open" | "reveal" | "edit" | "remove" | "trash"): string {
+function svg(name: "open" | "reveal" | "edit" | "remove" | "trash" | "copy"): string {
   const paths = {
     open: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
     reveal: "M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1zM10 13h6M13 10l3 3-3 3",
     edit: "M4 20h4L19 9l-4-4L4 16zM14 6l4 4",
     remove: "M6 6l12 12M18 6L6 18",
+    copy: "M9 9h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V10a1 1 0 0 1 1-1zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1",
     trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
   };
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[name]}"/></svg>`;
@@ -262,7 +311,18 @@ function renderSpace(s: SpaceView): string {
     </div>
     ${
       s.items.length
-        ? `<div class="toolbar">
+        ? `${
+            state.selected.size
+              ? `<div class="selection-bar">
+                   <span><strong>${state.selected.size}</strong> ausgewählt</span>
+                   <button class="btn small primary" data-action="copy-selected" title="Strg+C">Kopieren</button>
+                   <button class="btn small" data-action="copy-paths-selected" title="Strg+Umschalt+C">Pfade kopieren</button>
+                   <button class="btn small" data-action="select-all" title="Strg+A">Alle auswählen</button>
+                   <button class="btn small" data-action="clear-selection" title="Esc">Auswahl aufheben</button>
+                 </div>`
+              : ""
+          }
+           <div class="toolbar">
              <input type="search" id="filter" class="search" placeholder="In diesem Space filtern…" value="${esc(state.filter)}" />
              <select id="sort" aria-label="Sortierung">
                ${(
@@ -305,6 +365,7 @@ function renderSearch(): string {
         </button>
         <div class="item-actions">
           ${h.item.exists ? `<button class="icon-btn" data-action="open" title="Öffnen">${svg("open")}</button>
+          <button class="icon-btn" data-action="copy" title="In Zwischenablage kopieren">${svg("copy")}</button>
           <button class="icon-btn" data-action="reveal" title="Im Explorer zeigen">${svg("reveal")}</button>` : ""}
         </div>
       </li>`,
@@ -370,7 +431,11 @@ function autosize(t: HTMLTextAreaElement) {
 
 app.addEventListener("click", async (ev) => {
   const btn = (ev.target as HTMLElement).closest<HTMLElement>("[data-action]");
-  if (!btn) return;
+  if (!btn) {
+    const row = (ev.target as HTMLElement).closest<HTMLElement>(".item.selectable");
+    if (row && !(ev.target as HTMLElement).closest("input, textarea, form")) selectRow(row.dataset.id!, ev);
+    return;
+  }
   const action = btn.dataset.action!;
   const row = btn.closest<HTMLElement>(".item");
   const s = state.current;
@@ -406,6 +471,18 @@ app.addEventListener("click", async (ev) => {
     }
     case "open":
       return void guard(api.openPath(row!.dataset.path!));
+    case "copy":
+      return copyFiles([row!.dataset.path!]);
+    case "copy-selected":
+      return copyFiles(selectedPaths());
+    case "copy-paths-selected":
+      return copyPaths(selectedPaths());
+    case "select-all":
+      s?.items.forEach((i) => state.selected.add(i.id));
+      return render();
+    case "clear-selection":
+      state.selected.clear();
+      return render();
     case "reveal":
       return void guard(api.revealPath(row!.dataset.path!));
     case "edit":
@@ -418,6 +495,7 @@ app.addEventListener("click", async (ev) => {
     case "remove":
       if (!s) return;
       await guard(api.removeItem(s.id, row!.dataset.id!));
+      state.selected.delete(row!.dataset.id!);
       toast("Aus dem Space entfernt. Das Original ist unverändert.");
       return refresh();
     case "relink": {
@@ -490,6 +568,25 @@ app.addEventListener("change", async (ev) => {
   } else if (t.id === "space-desc" && s && t.value !== s.description) {
     await guard(api.updateSpace(s.id, { description: t.value }));
     s.description = t.value;
+  }
+});
+
+// Global shortcuts for the selection; ignored while typing in a field.
+document.addEventListener("keydown", (ev) => {
+  const t = ev.target as HTMLElement;
+  if (t.closest("input, textarea, select") || !state.current || state.globalQuery) return;
+  const ctrl = ev.ctrlKey || ev.metaKey;
+  const key = ev.key.toLowerCase();
+  if (ctrl && key === "c" && state.selected.size) {
+    ev.preventDefault();
+    void (ev.shiftKey ? copyPaths(selectedPaths()) : copyFiles(selectedPaths()));
+  } else if (ctrl && key === "a") {
+    ev.preventDefault();
+    state.current.items.forEach((i) => state.selected.add(i.id));
+    render();
+  } else if (ev.key === "Escape" && state.selected.size && !state.creating && !state.editingItem) {
+    state.selected.clear();
+    render();
   }
 });
 

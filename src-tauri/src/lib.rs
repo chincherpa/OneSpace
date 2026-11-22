@@ -1,3 +1,4 @@
+mod clipboard;
 mod store;
 
 use serde::Serialize;
@@ -352,6 +353,31 @@ fn search(st: State<AppStore>, query: String) -> Result<Vec<SearchHit>> {
     Ok(hits)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CopyResult {
+    copied: usize,
+    missing: usize,
+}
+
+/// Copies the referenced files/folders themselves to the clipboard (paste with Ctrl+V in Explorer).
+/// Missing originals are skipped.
+#[tauri::command]
+fn copy_files(paths: Vec<String>) -> Result<CopyResult> {
+    let (ok, missing): (Vec<String>, Vec<String>) = paths.into_iter().partition(|p| Path::new(p).exists());
+    if ok.is_empty() {
+        return Err(Error::Other("Keine der gewählten Dateien ist auffindbar".into()));
+    }
+    clipboard::set_files(&ok).map_err(Error::Other)?;
+    Ok(CopyResult { copied: ok.len(), missing: missing.len() })
+}
+
+/// Copies the full paths as text, one per line.
+#[tauri::command]
+fn copy_paths(paths: Vec<String>) -> Result<()> {
+    clipboard::set_text(&paths.join("\r\n")).map_err(Error::Other)
+}
+
 #[tauri::command]
 fn open_path(path: String) -> Result<()> {
     tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| Error::Other(e.to_string()))
@@ -384,6 +410,8 @@ pub fn run() {
             relink_item,
             search,
             open_path,
+            copy_files,
+            copy_paths,
             reveal_path
         ])
         .run(tauri::generate_context!())

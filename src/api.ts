@@ -48,6 +48,11 @@ export interface SearchHit {
   item: ItemView;
 }
 
+export interface CopyResult {
+  copied: number;
+  missing: number;
+}
+
 export const api = {
   listSpaces: () => invoke<SpaceSummary[]>("list_spaces"),
   getSpace: (id: string) => invoke<SpaceView>("get_space", { id }),
@@ -64,4 +69,6 @@ export const api = {
   search: (query: string) => invoke<SearchHit[]>("search", { query }),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
+  copyFiles: (paths: string[]) => invoke<CopyResult>("copy_files", { paths }),
+  copyPaths: (paths: string[]) => invoke<void>("copy_paths", { paths }),
 };
