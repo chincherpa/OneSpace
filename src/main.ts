@@ -304,6 +304,7 @@ function renderItem(i: ItemView): string {
                <button class="icon-btn" data-action="reveal" title="Im Explorer zeigen">${svg("reveal")}</button>`
             : `<button class="btn small" data-action="relink" title="Neuen Speicherort wählen">Neu verknüpfen</button>`
         }
+        <button class="icon-btn" data-action="copy-path" title="Pfad kopieren (Strg+Umschalt+C)">${svg("path")}</button>
         <button class="icon-btn" data-action="edit" title="Bezeichnung &amp; Notiz">${svg("edit")}</button>
         <button class="icon-btn danger" data-action="remove" title="Aus Space entfernen (Original bleibt)">${svg("remove")}</button>
       </div>
@@ -332,13 +333,14 @@ function metaFor(i: ItemView): string {
   }
 }
 
-function svg(name: "open" | "reveal" | "edit" | "remove" | "trash" | "copy" | "network" | "offline"): string {
+function svg(name: "open" | "reveal" | "edit" | "remove" | "trash" | "copy" | "path" | "network" | "offline"): string {
   const paths = {
     open: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
     reveal: "M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1zM10 13h6M13 10l3 3-3 3",
     edit: "M4 20h4L19 9l-4-4L4 16zM14 6l4 4",
     remove: "M6 6l12 12M18 6L6 18",
     copy: "M9 9h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V10a1 1 0 0 1 1-1zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1",
+    path: "M4 6h16M4 12h10M4 18h7M15 15l3 3 3-3M18 11v7",
     network: "M12 3v6M5 21h14M12 15v6M4 9h16v6H4z",
     offline: "M3 3l18 18M8.5 8.5A5 5 0 0 0 7 18h10M17.7 13.1A4 4 0 0 0 12.6 8M10 5.3A6 6 0 0 1 18 10",
     trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
@@ -426,6 +428,7 @@ function renderSearch(): string {
           ${statusOf(h.item) !== "missing" ? `<button class="icon-btn" data-action="open" title="Öffnen">${svg("open")}</button>
           <button class="icon-btn" data-action="copy" title="In Zwischenablage kopieren">${svg("copy")}</button>
           <button class="icon-btn" data-action="reveal" title="Im Explorer zeigen">${svg("reveal")}</button>` : ""}
+          <button class="icon-btn" data-action="copy-path" title="Pfad kopieren">${svg("path")}</button>
         </div>
       </li>`,
     )
@@ -532,6 +535,8 @@ app.addEventListener("click", async (ev) => {
       return void guard(api.openPath(row!.dataset.path!));
     case "copy":
       return copyFiles([row!.dataset.path!]);
+    case "copy-path":
+      return copyPaths([row!.dataset.path!]);
     case "copy-selected":
       return copyFiles(selectedPaths());
     case "copy-paths-selected":

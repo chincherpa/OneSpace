@@ -10,7 +10,7 @@ Windows-Desktop-App (Tauri 2): Lege für jedes Projekt einen **Space** an und f�
 - Dateien/Ordner per **Drag & Drop aus dem Explorer** hinzufügen. Wer auf einen Space in der Seitenleiste zieht, fügt die Elemente direkt dort hinzu. Alternativ geht es über die Dateiauswahl.
 - Jede Verknüpfung zeigt ihren Herkunftsort (Dokumente, Downloads, OneDrive …), Größe und Änderungsdatum.
 - Elemente öffnen (Doppelklick) oder im Explorer anzeigen.
-- **In die Zwischenablage kopieren:** einzeln über das Kopier-Symbol oder per Mehrfachauswahl (Klick, Strg+Klick, Umschalt+Klick, Strg+A) und **Strg+C**. Kopiert werden die echten Dateien/Ordner, wie im Explorer. Mit Strg+V lassen sie sich im Explorer, in Outlook, Teams usw. einfügen, in Texteditoren als Pfade. **Strg+Umschalt+C** bzw. „Pfade kopieren“ kopiert nur die Pfade als Text.
+- **In die Zwischenablage kopieren:** einzeln über das Kopier-Symbol oder per Mehrfachauswahl (Klick, Strg+Klick, Umschalt+Klick, Strg+A) und **Strg+C**. Kopiert werden die echten Dateien/Ordner, wie im Explorer. Mit Strg+V lassen sie sich im Explorer, in Outlook, Teams usw. einfügen, in Texteditoren als Pfade. **Strg+Umschalt+C** bzw. „Pfade kopieren“ kopiert nur die Pfade als Text. Jedes Element hat dafür zusätzlich ein eigenes Symbol „Pfad kopieren“ (auch bei nicht gefundenen Dateien und in den Suchtreffern).
 - Eigene Bezeichnung und Notiz pro Element, zum Beispiel welche Rolle es im Projekt spielt.
 - Erkennung verschobener oder gelöschter Originale („Nicht gefunden“) und **Neu verknüpfen**.
 - **Netzwerkordner:** UNC-Pfade (`\\server\freigabe\…`) und verbundene Netzlaufwerke (`Z:\…`) werden erkannt und als „Netzwerk · server\freigabe“ angezeigt. `Z:\a.pdf` und `\\server\freigabe\a.pdf` gelten als dieselbe Datei.
