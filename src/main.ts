@@ -1,6 +1,15 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ask, open } from "@tauri-apps/plugin-dialog";
-import { api, type ItemView, type Probe, type SearchHit, type SpaceHealth, type SpaceSummary, type SpaceView } from "./api";
+import {
+  api,
+  type ItemView,
+  type Probe,
+  type SearchHit,
+  type SpaceHealth,
+  type SpaceSummary,
+  type SpaceView,
+  type TagCount,
+} from "./api";
 
 const COLORS = ["#4f7cff", "#16a37f", "#e2683c", "#a35bd6", "#d4a017", "#d6457a", "#2e9bc4", "#6b7a8f"];
 
@@ -13,6 +22,10 @@ const state = {
   sort: "added" as SortKey,
   globalQuery: "",
   hits: [] as SearchHit[],
+  /** Dashboard: all tags, the chosen one and the items carrying it. */
+  tags: [] as TagCount[],
+  activeTag: null as string | null,
+  tagHits: [] as SearchHit[],
   editingItem: null as string | null,
   creating: false,
   dragging: false,
@@ -100,15 +113,46 @@ async function refresh() {
     state.current = (await guard(api.getSpace(state.current.id))) ?? null;
   }
   if (state.globalQuery) state.hits = (await guard(api.search(state.globalQuery))) ?? [];
+  await loadTags();
   render();
   void probeVisible();
   void loadHealth();
 }
 
+async function loadTags() {
+  state.tags = (await guard(api.listTags())) ?? [];
+  const active = state.activeTag?.toLowerCase();
+  if (active && !state.tags.some((t) => t.name.toLowerCase() === active)) state.activeTag = null;
+  state.tagHits = state.activeTag ? ((await guard(api.itemsByTag(state.activeTag))) ?? []) : [];
+}
+
+/** Opens the dashboard, optionally with a tag selected. */
+async function showDashboard(tag: string | null = state.activeTag) {
+  state.current = null;
+  state.globalQuery = "";
+  state.hits = [];
+  state.filter = "";
+  state.editingItem = null;
+  state.selected.clear();
+  state.anchor = null;
+  state.activeTag = tag;
+  await loadTags();
+  render();
+  void probeVisible();
+}
+
+/** Items of the list currently shown with full actions: a space or the dashboard's tag view. */
+function listItems(): ItemView[] {
+  if (state.globalQuery) return [];
+  if (state.current) return state.current.items;
+  if (state.activeTag) return state.tagHits.map((h) => h.item);
+  return [];
+}
+
 let probeSeq = 0;
 /** Checks existence/size/date of the visible items in the background. */
 async function probeVisible() {
-  const paths = [...new Set([...(state.current?.items ?? []), ...state.hits.map((h) => h.item)].map((i) => i.path))];
+  const paths = [...new Set([...(state.current?.items ?? []), ...[...state.hits, ...state.tagHits].map((h) => h.item)].map((i) => i.path))];
   if (!paths.length) return;
   const seq = ++probeSeq;
   const res = await guard(api.probe(paths));
@@ -132,11 +176,6 @@ async function selectSpace(id: string) {
   state.anchor = null;
   state.globalQuery = "";
   state.hits = [];
-  try {
-    localStorage.setItem("onespace.lastSpace", id);
-  } catch {
-    /* storage unavailable */
-  }
   render();
   void probeVisible();
 }
@@ -183,14 +222,13 @@ async function copyPaths(paths: string[]) {
 
 /** Paths of the selection, in the order shown. */
 function selectedPaths(): string[] {
-  if (!state.current) return [];
-  return sortedItems(state.current.items)
+  return sortedItems(listItems())
     .filter((i) => state.selected.has(i.id))
     .map((i) => i.path);
 }
 
 function selectRow(id: string, ev: MouseEvent) {
-  const visible = state.current ? sortedItems(state.current.items).map((i) => i.id) : [];
+  const visible = sortedItems(listItems()).map((i) => i.id);
   if (ev.shiftKey && state.anchor && visible.includes(state.anchor)) {
     const [a, b] = [visible.indexOf(state.anchor), visible.indexOf(id)].sort((x, y) => x - y);
     if (!ev.ctrlKey) state.selected.clear();
@@ -211,7 +249,7 @@ function selectRow(id: string, ev: MouseEvent) {
 function sortedItems(items: ItemView[]): ItemView[] {
   const f = state.filter.trim().toLowerCase();
   const list = f
-    ? items.filter((i) => `${i.label ?? ""} ${i.name} ${i.path} ${i.note}`.toLowerCase().includes(f))
+    ? items.filter((i) => `${i.label ?? ""} ${i.name} ${i.path} ${i.note} ${i.tags.join(" ")}`.toLowerCase().includes(f))
     : [...items];
   const name = (i: ItemView) => (i.label ?? i.name).toLowerCase();
   const cmp: Record<SortKey, (a: ItemView, b: ItemView) => number> = {
@@ -254,6 +292,11 @@ function renderSidebar(): string {
         <span>OneSpace</span>
       </div>
       <input class="search" id="global-search" type="search" placeholder="In allen Spaces suchen…" value="${esc(state.globalQuery)}" />
+      <button class="space-link nav ${!state.current && !state.globalQuery ? "active" : ""}" data-action="dashboard">
+        ${svg("grid")}
+        <span class="space-name">Dashboard</span>
+        ${state.tags.length ? `<span class="count" title="Tags">${state.tags.length}</span>` : ""}
+      </button>
       <div class="section-label">Spaces</div>
       <ul class="space-list">${items}</ul>
       ${
@@ -267,12 +310,43 @@ function renderSidebar(): string {
     </aside>`;
 }
 
-function renderItem(i: ItemView): string {
+function tagChips(tags: string[]): string {
+  if (!tags.length) return "";
+  return `<div class="item-tags">${tags
+    .map(
+      (t) => `<button class="tag ${state.activeTag?.toLowerCase() === t.toLowerCase() && !state.current ? "active" : ""}"
+                      data-action="goto-tag" data-tag="${esc(t)}" title="Alle Elemente mit diesem Tag">#${esc(t)}</button>`,
+    )
+    .join("")}</div>`;
+}
+
+const parseTags = (s: string) => s.split(/[,;]/).map((t) => t.trim()).filter(Boolean);
+
+function tagEditor(i: ItemView): string {
+  const own = new Set(i.tags.map((t) => t.toLowerCase()));
+  const suggestions = state.tags.filter((t) => !own.has(t.name.toLowerCase())).slice(0, 12);
+  return `
+    <input name="tags" placeholder="Tags, durch Komma getrennt (z. B. Rechnung, Kunde A)" value="${esc(i.tags.join(", "))}" autocomplete="off" />
+    ${
+      suggestions.length
+        ? `<div class="tag-suggestions">${suggestions
+            .map((t) => `<button type="button" class="tag" data-action="suggest-tag" data-tag="${esc(t.name)}">+ ${esc(t.name)}</button>`)
+            .join("")}</div>`
+        : ""
+    }`;
+}
+
+/**
+ * One row with all actions. `spaceId` is the space the item belongs to; `hit` adds a chip
+ * linking to that space (used outside a space, e.g. in the dashboard's tag view).
+ */
+function renderItem(i: ItemView, spaceId: string, hit?: SearchHit): string {
   const editing = state.editingItem === i.id;
   const title = i.label ?? i.name;
   const st = statusOf(i);
   return `
-    <li class="item selectable ${st} ${state.selected.has(i.id) ? "selected" : ""}" data-id="${i.id}" data-path="${esc(i.path)}">
+    <li class="item selectable ${hit ? "with-space" : ""} ${st} ${state.selected.has(i.id) ? "selected" : ""}"
+        data-id="${i.id}" data-path="${esc(i.path)}" data-space="${spaceId}">
       ${iconFor(i)}
       <div class="item-body">
         ${
@@ -280,6 +354,7 @@ function renderItem(i: ItemView): string {
             ? `<form class="edit-form" data-id="${i.id}">
                  <input name="label" placeholder="${esc(i.name)}" value="${esc(i.label ?? "")}" />
                  <textarea name="note" rows="2" placeholder="Notiz zur Rolle im Projekt…">${esc(i.note)}</textarea>
+                 ${tagEditor(i)}
                  <div class="row">
                    <button type="submit" class="btn primary small">Speichern</button>
                    <button type="button" class="btn small" data-action="cancel-edit">Abbrechen</button>
@@ -290,9 +365,11 @@ function renderItem(i: ItemView): string {
                  ${locChip(i)}
                  <span class="parent" title="${esc(i.parent)}"><bdi dir="ltr">${esc(i.parent)}</bdi></span>
                </div>
-               ${i.note ? `<div class="item-note">${esc(i.note)}</div>` : ""}`
+               ${i.note ? `<div class="item-note">${esc(i.note)}</div>` : ""}
+               ${tagChips(i.tags)}`
         }
       </div>
+      ${hit ? spaceChip(hit) : ""}
       <div class="item-meta">
         ${metaFor(i)}
       </div>
@@ -305,10 +382,16 @@ function renderItem(i: ItemView): string {
             : `<button class="btn small" data-action="relink" title="Neuen Speicherort wählen">Neu verknüpfen</button>`
         }
         <button class="icon-btn" data-action="copy-path" title="Pfad kopieren (Strg+Umschalt+C)">${svg("path")}</button>
-        <button class="icon-btn" data-action="edit" title="Bezeichnung &amp; Notiz">${svg("edit")}</button>
+        <button class="icon-btn" data-action="edit" title="Bezeichnung, Notiz &amp; Tags">${svg("edit")}</button>
         <button class="icon-btn danger" data-action="remove" title="Aus Space entfernen (Original bleibt)">${svg("remove")}</button>
       </div>
     </li>`;
+}
+
+function spaceChip(h: SearchHit): string {
+  return `<button class="space-chip" data-action="goto-space" data-id="${h.spaceId}" title="Space öffnen">
+            <span class="dot" style="background:${esc(h.spaceColor)}"></span>${esc(h.spaceName)}
+          </button>`;
 }
 
 function locChip(i: ItemView): string {
@@ -333,7 +416,9 @@ function metaFor(i: ItemView): string {
   }
 }
 
-function svg(name: "open" | "reveal" | "edit" | "remove" | "trash" | "copy" | "path" | "network" | "offline"): string {
+type IconName = "open" | "reveal" | "edit" | "remove" | "trash" | "copy" | "path" | "network" | "offline" | "grid" | "tag";
+
+function svg(name: IconName): string {
   const paths = {
     open: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
     reveal: "M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1zM10 13h6M13 10l3 3-3 3",
@@ -344,8 +429,40 @@ function svg(name: "open" | "reveal" | "edit" | "remove" | "trash" | "copy" | "p
     network: "M12 3v6M5 21h14M12 15v6M4 9h16v6H4z",
     offline: "M3 3l18 18M8.5 8.5A5 5 0 0 0 7 18h10M17.7 13.1A4 4 0 0 0 12.6 8M10 5.3A6 6 0 0 1 18 10",
     trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
+    grid: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+    tag: "M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9zM7.5 7.5h.01",
   };
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[name]}"/></svg>`;
+}
+
+/** Selection bar, filter and sort; shared by the space view and the dashboard's tag view. */
+function listControls(filterPlaceholder: string): string {
+  return `${
+    state.selected.size
+      ? `<div class="selection-bar">
+           <span><strong>${state.selected.size}</strong> ausgewählt</span>
+           <button class="btn small primary" data-action="copy-selected" title="Strg+C">Kopieren</button>
+           <button class="btn small" data-action="copy-paths-selected" title="Strg+Umschalt+C">Pfade kopieren</button>
+           <button class="btn small" data-action="select-all" title="Strg+A">Alle auswählen</button>
+           <button class="btn small" data-action="clear-selection" title="Esc">Auswahl aufheben</button>
+         </div>`
+      : ""
+  }
+   <div class="toolbar">
+     <input type="search" id="filter" class="search" placeholder="${esc(filterPlaceholder)}" value="${esc(state.filter)}" />
+     <select id="sort" aria-label="Sortierung">
+       ${(
+         [
+           ["added", "Zuletzt hinzugefügt"],
+           ["name", "Name"],
+           ["location", "Speicherort"],
+           ["modified", "Zuletzt geändert"],
+         ] as const
+       )
+         .map(([k, l]) => `<option value="${k}" ${state.sort === k ? "selected" : ""}>${l}</option>`)
+         .join("")}
+     </select>
+   </div>`;
 }
 
 function renderSpace(s: SpaceView): string {
@@ -372,33 +489,8 @@ function renderSpace(s: SpaceView): string {
     </div>
     ${
       s.items.length
-        ? `${
-            state.selected.size
-              ? `<div class="selection-bar">
-                   <span><strong>${state.selected.size}</strong> ausgewählt</span>
-                   <button class="btn small primary" data-action="copy-selected" title="Strg+C">Kopieren</button>
-                   <button class="btn small" data-action="copy-paths-selected" title="Strg+Umschalt+C">Pfade kopieren</button>
-                   <button class="btn small" data-action="select-all" title="Strg+A">Alle auswählen</button>
-                   <button class="btn small" data-action="clear-selection" title="Esc">Auswahl aufheben</button>
-                 </div>`
-              : ""
-          }
-           <div class="toolbar">
-             <input type="search" id="filter" class="search" placeholder="In diesem Space filtern…" value="${esc(state.filter)}" />
-             <select id="sort" aria-label="Sortierung">
-               ${(
-                 [
-                   ["added", "Zuletzt hinzugefügt"],
-                   ["name", "Name"],
-                   ["location", "Speicherort"],
-                   ["modified", "Zuletzt geändert"],
-                 ] as const
-               )
-                 .map(([k, l]) => `<option value="${k}" ${state.sort === k ? "selected" : ""}>${l}</option>`)
-                 .join("")}
-             </select>
-           </div>
-           <ul class="items">${items.map(renderItem).join("") || `<li class="no-match">Keine Treffer.</li>`}</ul>`
+        ? `${listControls("In diesem Space filtern…")}
+           <ul class="items">${items.map((i) => renderItem(i, s.id)).join("") || `<li class="no-match">Keine Treffer.</li>`}</ul>`
         : `<div class="dropzone-empty">
              <div class="big">Dateien und Ordner hierher ziehen</div>
              <p>Aus Dokumente, Downloads, OneDrive, Desktop oder einem anderen Projektordner.
@@ -420,10 +512,9 @@ function renderSearch(): string {
         <div class="item-body">
           <div class="item-title">${esc(h.item.label ?? h.item.name)}</div>
           <div class="item-path">${locChip(h.item)}<span class="parent" title="${esc(h.item.parent)}"><bdi dir="ltr">${esc(h.item.parent)}</bdi></span></div>
+          ${tagChips(h.item.tags)}
         </div>
-        <button class="space-chip" data-action="goto-space" data-id="${h.spaceId}">
-          <span class="dot" style="background:${esc(h.spaceColor)}"></span>${esc(h.spaceName)}
-        </button>
+        ${spaceChip(h)}
         <div class="item-actions">
           ${statusOf(h.item) !== "missing" ? `<button class="icon-btn" data-action="open" title="Öffnen">${svg("open")}</button>
           <button class="icon-btn" data-action="copy" title="In Zwischenablage kopieren">${svg("copy")}</button>
@@ -439,9 +530,55 @@ function renderSearch(): string {
     <ul class="items">${rows || `<li class="no-match">Nichts gefunden.</li>`}</ul>`;
 }
 
+function renderDashboard(): string {
+  const total = state.spaces.reduce((n, s) => n + s.itemCount, 0);
+  const active = state.activeTag?.toLowerCase();
+  const pills = state.tags
+    .map(
+      (t) => `<button class="tag-pill ${t.name.toLowerCase() === active ? "active" : ""}" data-action="toggle-tag" data-tag="${esc(t.name)}">
+                ${svg("tag")}<span>${esc(t.name)}</span><span class="count">${t.count}</span>
+              </button>`,
+    )
+    .join("");
+  const byId = new Map(state.tagHits.map((h) => [h.item.id, h]));
+  const items = sortedItems(state.tagHits.map((h) => h.item));
+  return `
+    <header class="space-header"><h1 class="space-title static">Dashboard</h1></header>
+    <div class="stats">
+      <span>${state.tags.length} Tag${state.tags.length === 1 ? "" : "s"}</span>
+      <span>${state.spaces.length} Space${state.spaces.length === 1 ? "" : "s"}</span>
+      <span>${total} Verknüpfung${total === 1 ? "" : "en"}</span>
+    </div>
+    ${
+      state.tags.length
+        ? `<div class="tag-cloud">${pills}</div>`
+        : `<div class="dropzone-empty">
+             <div class="big">Noch keine Tags vergeben</div>
+             <p>Öffne einen Space und klicke bei einem Element auf das Stift-Symbol.
+                Dort kannst du Tags eintragen, zum Beispiel „Rechnung“ oder „Vertrag“.
+                Hier siehst du dann alle Elemente mit diesem Tag, über alle Spaces hinweg.</p>
+           </div>`
+    }
+    ${
+      state.activeTag
+        ? `<h2 class="tag-heading">${svg("tag")} ${esc(state.activeTag)}
+             <span class="count">${state.tagHits.length} Element${state.tagHits.length === 1 ? "" : "e"}</span>
+           </h2>
+           ${listControls(`In „${state.activeTag}“ filtern…`)}
+           <ul class="items">${
+             items.map((i) => renderItem(i, byId.get(i.id)!.spaceId, byId.get(i.id))).join("") ||
+             `<li class="no-match">Keine Treffer.</li>`
+           }</ul>`
+        : state.tags.length
+          ? `<p class="hint">Wähle ein Tag, um alle Elemente damit zu sehen.</p>`
+          : ""
+    }`;
+}
+
 function renderMain(): string {
   if (state.globalQuery) return renderSearch();
   if (state.current) return renderSpace(state.current);
+  if (state.spaces.length) return renderDashboard();
   return `
     <div class="welcome">
       <h1>Ein Space für jedes Projekt</h1>
@@ -501,10 +638,29 @@ app.addEventListener("click", async (ev) => {
   const action = btn.dataset.action!;
   const row = btn.closest<HTMLElement>(".item");
   const s = state.current;
+  /** Space of the clicked row; differs from `state.current` in the dashboard. */
+  const rowSpace = row?.dataset.space;
 
   switch (action) {
     case "select":
       return selectSpace(btn.dataset.id!);
+    case "dashboard":
+      return showDashboard();
+    case "toggle-tag": {
+      const t = btn.dataset.tag!;
+      return showDashboard(state.activeTag?.toLowerCase() === t.toLowerCase() ? null : t);
+    }
+    case "goto-tag":
+      return showDashboard(btn.dataset.tag!);
+    case "suggest-tag": {
+      const input = btn.closest("form")?.querySelector<HTMLInputElement>('input[name="tags"]');
+      if (!input) return;
+      const tags = parseTags(input.value);
+      if (!tags.some((t) => t.toLowerCase() === btn.dataset.tag!.toLowerCase())) tags.push(btn.dataset.tag!);
+      input.value = tags.join(", ");
+      btn.remove();
+      return input.focus();
+    }
     case "goto-space":
       return selectSpace(btn.dataset.id!);
     case "new-space":
@@ -542,7 +698,7 @@ app.addEventListener("click", async (ev) => {
     case "copy-paths-selected":
       return copyPaths(selectedPaths());
     case "select-all":
-      s?.items.forEach((i) => state.selected.add(i.id));
+      listItems().forEach((i) => state.selected.add(i.id));
       return render();
     case "clear-selection":
       state.selected.clear();
@@ -557,17 +713,17 @@ app.addEventListener("click", async (ev) => {
       state.editingItem = null;
       return render();
     case "remove":
-      if (!s) return;
-      await guard(api.removeItem(s.id, row!.dataset.id!));
+      if (!rowSpace) return;
+      await guard(api.removeItem(rowSpace, row!.dataset.id!));
       state.selected.delete(row!.dataset.id!);
       toast("Aus dem Space entfernt. Das Original ist unverändert.");
       return refresh();
     case "relink": {
-      if (!s) return;
-      const item = s.items.find((i) => i.id === row!.dataset.id);
+      if (!rowSpace) return;
+      const item = listItems().find((i) => i.id === row!.dataset.id);
       const sel = await open({ multiple: false, directory: item?.kind === "folder", title: "Neuen Speicherort wählen" });
       if (typeof sel !== "string") return;
-      await guard(api.relinkItem(s.id, row!.dataset.id!, sel));
+      await guard(api.relinkItem(rowSpace, row!.dataset.id!, sel));
       return refresh();
     }
   }
@@ -589,12 +745,15 @@ app.addEventListener("submit", async (ev) => {
     const created = await guard(api.createSpace(name));
     await refresh();
     if (created) await selectSpace(created.id);
-  } else if (form.classList.contains("edit-form") && state.current) {
+  } else if (form.classList.contains("edit-form")) {
+    const spaceId = form.closest<HTMLElement>(".item")?.dataset.space;
+    if (!spaceId) return;
     const fd = new FormData(form);
     await guard(
-      api.updateItem(state.current.id, form.dataset.id!, {
+      api.updateItem(spaceId, form.dataset.id!, {
         label: String(fd.get("label") ?? ""),
         note: String(fd.get("note") ?? ""),
+        tags: parseTags(String(fd.get("tags") ?? "")),
       }),
     );
     state.editingItem = null;
@@ -638,7 +797,8 @@ app.addEventListener("change", async (ev) => {
 // Global shortcuts for the selection; ignored while typing in a field.
 document.addEventListener("keydown", (ev) => {
   const t = ev.target as HTMLElement;
-  if (t.closest("input, textarea, select") || !state.current || state.globalQuery) return;
+  const items = listItems();
+  if (t.closest("input, textarea, select") || !items.length) return;
   const ctrl = ev.ctrlKey || ev.metaKey;
   const key = ev.key.toLowerCase();
   if (ctrl && key === "c" && state.selected.size) {
@@ -646,7 +806,7 @@ document.addEventListener("keydown", (ev) => {
     void (ev.shiftKey ? copyPaths(selectedPaths()) : copyFiles(selectedPaths()));
   } else if (ctrl && key === "a") {
     ev.preventDefault();
-    state.current.items.forEach((i) => state.selected.add(i.id));
+    items.forEach((i) => state.selected.add(i.id));
     render();
   } else if (ev.key === "Escape" && state.selected.size && !state.creating && !state.editingItem) {
     state.selected.clear();
@@ -715,14 +875,5 @@ void getCurrentWebview().onDragDropEvent(async (ev) => {
 // Re-check file existence when the window regains focus (files may have moved meanwhile).
 window.addEventListener("focus", () => void refresh());
 
-(async () => {
-  await refresh();
-  let last: string | null = null;
-  try {
-    last = localStorage.getItem("onespace.lastSpace");
-  } catch {
-    /* storage unavailable */
-  }
-  const id = state.spaces.find((s) => s.id === last)?.id ?? state.spaces[0]?.id;
-  if (id) await selectSpace(id);
-})();
+// Start on the dashboard.
+void refresh();

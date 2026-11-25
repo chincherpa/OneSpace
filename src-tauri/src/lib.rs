@@ -6,7 +6,7 @@ use net::{Probe, Status};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use store::{now_ms, Error, Item, Kind, Result, Space, Store};
+use store::{normalize_tags, now_ms, Error, Item, Kind, Result, Space, Store};
 use tauri::{Manager, State};
 
 type AppStore = Mutex<Store>;
@@ -38,6 +38,7 @@ struct ItemView {
     name: String,
     label: Option<String>,
     note: String,
+    tags: Vec<String>,
     added_at: u64,
     extension: String,
     /// Human readable origin, e.g. "Dokumente", "OneDrive", "Netzwerk · nas\projekte".
@@ -73,6 +74,13 @@ struct SearchHit {
     space_name: String,
     space_color: String,
     item: ItemView,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TagCount {
+    name: String,
+    count: usize,
 }
 
 #[derive(Serialize)]
@@ -154,6 +162,7 @@ fn view_item(item: &Item) -> ItemView {
         name,
         label: item.label.clone(),
         note: item.note.clone(),
+        tags: item.tags.clone(),
         added_at: item.added_at,
         extension: p
             .extension()
@@ -287,6 +296,7 @@ async fn add_paths(st: State<'_, AppStore>, space_id: String, paths: Vec<String>
                     path: p.path,
                     label: None,
                     note: String::new(),
+                    tags: vec![],
                     added_at: now_ms(),
                 });
                 res.added += 1;
@@ -318,9 +328,13 @@ fn update_item(
     item_id: String,
     label: Option<String>,
     note: Option<String>,
+    tags: Option<Vec<String>>,
 ) -> Result<()> {
     let mut store = lock(&st)?;
     let item = store.space_mut(&space_id)?.item_mut(&item_id)?;
+    if let Some(t) = tags {
+        item.tags = normalize_tags(t);
+    }
     if let Some(l) = label {
         let l = l.trim();
         item.label = (!l.is_empty()).then(|| l.to_string());
@@ -359,10 +373,11 @@ fn search(st: State<AppStore>, query: String) -> Result<Vec<SearchHit>> {
     for s in &store.data.spaces {
         for i in &s.items {
             let hay = format!(
-                "{} {} {}",
+                "{} {} {} {}",
                 i.path.to_lowercase(),
                 i.label.as_deref().unwrap_or("").to_lowercase(),
-                i.note.to_lowercase()
+                i.note.to_lowercase(),
+                i.tags.join(" ").to_lowercase()
             );
             if hay.contains(&q) {
                 hits.push(SearchHit {
@@ -375,6 +390,45 @@ fn search(st: State<AppStore>, query: String) -> Result<Vec<SearchHit>> {
         }
     }
     Ok(hits)
+}
+
+/// All tags in use, with the number of items carrying them. Case-insensitive; the first
+/// spelling encountered is shown.
+fn tag_counts(spaces: &[Space]) -> Vec<TagCount> {
+    let mut map: std::collections::HashMap<String, TagCount> = std::collections::HashMap::new();
+    for t in spaces.iter().flat_map(|s| &s.items).flat_map(|i| &i.tags) {
+        map.entry(t.to_lowercase())
+            .or_insert_with(|| TagCount { name: t.clone(), count: 0 })
+            .count += 1;
+    }
+    let mut v: Vec<(String, TagCount)> = map.into_iter().collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v.into_iter().map(|(_, t)| t).collect()
+}
+
+#[tauri::command]
+fn list_tags(st: State<AppStore>) -> Result<Vec<TagCount>> {
+    Ok(tag_counts(&lock(&st)?.data.spaces))
+}
+
+/// Items across all spaces that carry the given tag (case-insensitive).
+#[tauri::command]
+fn items_by_tag(st: State<AppStore>, tag: String) -> Result<Vec<SearchHit>> {
+    let key = tag.trim().to_lowercase();
+    let store = lock(&st)?;
+    Ok(store
+        .data
+        .spaces
+        .iter()
+        .flat_map(|s| s.items.iter().map(move |i| (s, i)))
+        .filter(|(_, i)| i.tags.iter().any(|t| t.to_lowercase() == key))
+        .map(|(s, i)| SearchHit {
+            space_id: s.id.clone(),
+            space_name: s.name.clone(),
+            space_color: s.color.clone(),
+            item: view_item(i),
+        })
+        .collect())
 }
 
 // ---------- commands: file system (never on the main thread) ----------
@@ -476,6 +530,8 @@ pub fn run() {
             update_item,
             relink_item,
             search,
+            list_tags,
+            items_by_tag,
             probe,
             space_health,
             copy_files,
@@ -485,4 +541,42 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running OneSpace");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(tags: &[&str]) -> Item {
+        Item {
+            id: uuid::Uuid::new_v4().to_string(),
+            path: "C:\\x".into(),
+            kind: Kind::File,
+            label: None,
+            note: String::new(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            added_at: 0,
+        }
+    }
+
+    #[test]
+    fn tag_counts_merge_case_and_spaces() {
+        let space = |items| Space {
+            id: "s".into(),
+            name: "n".into(),
+            description: String::new(),
+            color: "#000".into(),
+            created_at: 0,
+            items,
+        };
+        let spaces = vec![
+            space(vec![item(&["Rechnung", "Kunde"]), item(&["rechnung"])]),
+            space(vec![item(&["Angebot"]), item(&[])]),
+        ];
+        let counts: Vec<(String, usize)> = tag_counts(&spaces).into_iter().map(|t| (t.name, t.count)).collect();
+        assert_eq!(
+            counts,
+            vec![("Angebot".into(), 1), ("Kunde".into(), 1), ("Rechnung".into(), 2)]
+        );
+    }
 }

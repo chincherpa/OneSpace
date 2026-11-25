@@ -49,6 +49,9 @@ pub struct Item {
     pub label: Option<String>,
     #[serde(default)]
     pub note: String,
+    /// Free keywords ("tags"), unique case-insensitively, in the order entered.
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub added_at: u64,
 }
 
@@ -113,6 +116,21 @@ impl Store {
     }
 }
 
+/// Trims and collapses whitespace, drops empty entries and leading '#',
+/// removes case-insensitive duplicates (first spelling wins).
+pub fn normalize_tags<I: IntoIterator<Item = S>, S: AsRef<str>>(tags: I) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    for t in tags {
+        let t = t.as_ref().trim().trim_start_matches('#');
+        let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !t.is_empty() && seen.insert(t.to_lowercase()) {
+            out.push(t);
+        }
+    }
+    out
+}
+
 impl Space {
     pub fn item_mut(&mut self, id: &str) -> Result<&mut Item> {
         self.items.iter_mut().find(|i| i.id == id).ok_or(Error::ItemNotFound)
@@ -140,6 +158,7 @@ mod tests {
                 kind: Kind::File,
                 label: None,
                 note: String::new(),
+                tags: vec!["Rechnung".into()],
                 added_at: 0,
             }],
         });
@@ -147,6 +166,23 @@ mod tests {
         let loaded = Store::load(file).unwrap();
         assert_eq!(loaded.data.spaces.len(), 1);
         assert_eq!(loaded.data.spaces[0].items[0].path, "C:\\Users\\a\\Documents\\x.xlsx");
+        assert_eq!(loaded.data.spaces[0].items[0].tags, vec!["Rechnung".to_string()]);
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn old_files_without_tags_load() {
+        let json = r##"{"version":1,"spaces":[{"id":"s","name":"n","color":"#000","createdAt":0,
+            "items":[{"id":"i","path":"C:\\x","kind":"file","addedAt":0}]}]}"##;
+        let data: Data = serde_json::from_str(json).unwrap();
+        assert!(data.spaces[0].items[0].tags.is_empty());
+    }
+
+    #[test]
+    fn tags_are_normalized() {
+        assert_eq!(
+            normalize_tags(["  Rechnung ", "#rechnung", "", "Kunde   A", "kunde a", "2026"]),
+            vec!["Rechnung", "Kunde A", "2026"]
+        );
     }
 }

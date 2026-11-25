@@ -16,6 +16,7 @@ export interface ItemView {
   name: string;
   label: string | null;
   note: string;
+  tags: string[];
   addedAt: number;
   extension: string;
   location: string;
@@ -62,6 +63,11 @@ export interface SearchHit {
   item: ItemView;
 }
 
+export interface TagCount {
+  name: string;
+  count: number;
+}
+
 export interface CopyResult {
   copied: number;
   missing: number;
@@ -77,11 +83,13 @@ export const api = {
   deleteSpace: (id: string) => invoke<void>("delete_space", { id }),
   addPaths: (spaceId: string, paths: string[]) => invoke<AddResult>("add_paths", { spaceId, paths }),
   removeItem: (spaceId: string, itemId: string) => invoke<void>("remove_item", { spaceId, itemId }),
-  updateItem: (spaceId: string, itemId: string, patch: { label?: string; note?: string }) =>
+  updateItem: (spaceId: string, itemId: string, patch: { label?: string; note?: string; tags?: string[] }) =>
     invoke<void>("update_item", { spaceId, itemId, ...patch }),
   relinkItem: (spaceId: string, itemId: string, newPath: string) =>
     invoke<void>("relink_item", { spaceId, itemId, newPath }),
   search: (query: string) => invoke<SearchHit[]>("search", { query }),
+  listTags: () => invoke<TagCount[]>("list_tags"),
+  itemsByTag: (tag: string) => invoke<SearchHit[]>("items_by_tag", { tag }),
   probe: (paths: string[]) => invoke<Probe[]>("probe", { paths }),
   spaceHealth: () => invoke<SpaceHealth[]>("space_health"),
   openPath: (path: string) => invoke<void>("open_path", { path }),

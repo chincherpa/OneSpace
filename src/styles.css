@@ -170,6 +170,30 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .edit-form { display: flex; flex-direction: column; gap: 6px; }
 .edit-form textarea { resize: vertical; }
 
+/* ---------- tags & dashboard ---------- */
+.space-link.nav svg { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; color: var(--muted); }
+.space-link.nav.active svg { color: var(--accent); }
+.item.with-space { grid-template-columns: 38px 1fr auto auto auto; }
+.item-tags, .tag-suggestions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.tag {
+  border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+  border-radius: 999px; padding: 0 8px; font-size: 11.5px; line-height: 18px; cursor: pointer;
+}
+.tag:hover { color: var(--accent); border-color: var(--accent); }
+.tag.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.tag-cloud { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px; }
+.tag-pill {
+  display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--panel); border-radius: 999px; padding: 6px 12px;
+}
+.tag-pill:hover { background: var(--hover); }
+.tag-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tag-pill.active .count { color: rgba(255,255,255,.85); }
+.tag-pill svg, .tag-heading svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tag-heading { display: flex; align-items: center; gap: 8px; font-size: 17px; margin: 0 0 12px; }
+.tag-heading .count { font-weight: 400; }
+.hint { color: var(--muted); }
+
 .space-chip {
   display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--panel);
   border-radius: 999px; padding: 3px 10px; cursor: pointer; font-size: 12px;
