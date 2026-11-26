@@ -1,6 +1,6 @@
 [package]
 name = "onespace"
-version = "0.1.0"
+version = "0.2.0"
 description = "Spaces that reference files and folders without moving them"
 edition = "2021"
 
