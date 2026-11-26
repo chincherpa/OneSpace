@@ -6,10 +6,19 @@ use net::{Probe, Status};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use store::{normalize_tags, now_ms, Error, Item, Kind, Result, Space, Store};
-use tauri::{Manager, State};
+use store::{normalize_tags, now_ms, read_data, write_data, Error, Item, Kind, Result, Settings, Space, Store};
+use tauri::{AppHandle, Manager, State};
 
 type AppStore = Mutex<Store>;
+
+const DATA_FILE: &str = "spaces.json";
+
+/// Where settings live, the default data file, and a problem found at startup (if any).
+struct Config {
+    settings_file: PathBuf,
+    default_data_file: PathBuf,
+    startup_warning: Mutex<Option<String>>,
+}
 
 const PALETTE: &[&str] = &[
     "#4f7cff", "#16a37f", "#e2683c", "#a35bd6", "#d4a017", "#d6457a", "#2e9bc4", "#6b7a8f",
@@ -26,6 +35,7 @@ struct SpaceSummary {
     id: String,
     name: String,
     color: String,
+    created_at: u64,
     item_count: usize,
 }
 
@@ -97,6 +107,27 @@ struct CopyResult {
     copied: usize,
     missing: usize,
     offline: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageInfo {
+    path: String,
+    default_path: String,
+    is_default: bool,
+    /// Set when the configured file could not be used at startup and the default was loaded instead.
+    warning: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocationCheck {
+    path: String,
+    exists: bool,
+    /// Number of spaces in an existing, readable file.
+    spaces: Option<usize>,
+    /// Why an existing file cannot be read.
+    error: Option<String>,
 }
 
 fn known_locations() -> &'static [(String, String)] {
@@ -179,6 +210,7 @@ fn summary(s: &Space) -> SpaceSummary {
         id: s.id.clone(),
         name: s.name.clone(),
         color: s.color.clone(),
+        created_at: s.created_at,
         item_count: s.items.len(),
     }
 }
@@ -431,6 +463,99 @@ fn items_by_tag(st: State<AppStore>, tag: String) -> Result<Vec<SearchHit>> {
         .collect())
 }
 
+// ---------- commands: storage location ----------
+
+fn target_file(cfg: &Config, dir: Option<String>) -> PathBuf {
+    match dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
+        Some(d) => PathBuf::from(net::normalize(&d)).join(DATA_FILE),
+        None => cfg.default_data_file.clone(),
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    net::path_key(&a.to_string_lossy()) == net::path_key(&b.to_string_lossy())
+}
+
+fn storage_info_of(store: &Store, cfg: &Config) -> Result<StorageInfo> {
+    Ok(StorageInfo {
+        path: store.file().display().to_string(),
+        default_path: cfg.default_data_file.display().to_string(),
+        is_default: same_file(store.file(), &cfg.default_data_file),
+        warning: cfg.startup_warning.lock().map_err(|_| Error::Other("lock poisoned".into()))?.clone(),
+    })
+}
+
+/// Checks that the folder of `file` is reachable (with the network timeout), then reads it.
+fn load_reachable(file: &Path) -> Result<store::Data> {
+    let dir = file.parent().map(|d| d.display().to_string()).unwrap_or_default();
+    match net::probe_all(std::slice::from_ref(&dir)).remove(0).status {
+        Status::Ok => read_data(file),
+        Status::Offline => Err(Error::Other(format!("Netzwerkfreigabe nicht erreichbar: {dir}"))),
+        Status::Missing => Err(Error::PathMissing(dir)),
+    }
+}
+
+#[tauri::command]
+fn storage_info(st: State<AppStore>, cfg: State<Config>) -> Result<StorageInfo> {
+    let store = lock(&st)?;
+    storage_info_of(&store, &cfg)
+}
+
+/// What is at the given folder (`None` = default location) before switching to it.
+#[tauri::command]
+async fn inspect_location(cfg: State<'_, Config>, dir: Option<String>) -> Result<LocationCheck> {
+    let file = target_file(&cfg, dir);
+    blocking(move || {
+        let path = file.display().to_string();
+        let dir = file.parent().map(|d| d.display().to_string()).unwrap_or_default();
+        // A missing folder is fine: it is created on save. An unreachable share is not.
+        if net::probe_all(std::slice::from_ref(&dir)).remove(0).status == Status::Offline {
+            return Err(Error::Other(format!("Netzwerkfreigabe nicht erreichbar: {dir}")));
+        }
+        if !file.exists() {
+            return Ok(LocationCheck { path, exists: false, spaces: None, error: None });
+        }
+        Ok(match read_data(&file) {
+            Ok(d) => LocationCheck { path, exists: true, spaces: Some(d.spaces.len()), error: None },
+            Err(e) => LocationCheck { path, exists: true, spaces: None, error: Some(e.to_string()) },
+        })
+    })
+    .await?
+}
+
+/// Moves the data file to `dir` (`None` = default location).
+/// `use_existing`: load the file already there instead of overwriting it with the current data.
+/// When overwriting, an existing file is kept as `spaces.json.bak`. The old file stays untouched.
+#[tauri::command]
+async fn change_location(app: AppHandle, dir: Option<String>, use_existing: bool) -> Result<StorageInfo> {
+    blocking(move || {
+        let cfg = app.state::<Config>();
+        let st = app.state::<AppStore>();
+        let file = target_file(&cfg, dir);
+        let mut store = lock(&st)?;
+        if !same_file(store.file(), &file) {
+            let data = if use_existing && file.exists() {
+                load_reachable(&file)?
+            } else {
+                if file.exists() {
+                    std::fs::copy(&file, file.with_extension("json.bak"))?;
+                }
+                let data = store::Data { version: store.data.version, spaces: store.data.spaces.clone() };
+                write_data(&file, &data)?;
+                data
+            };
+            store.relocate(file.clone(), data);
+        }
+        let is_default = same_file(&file, &cfg.default_data_file);
+        Settings { data_file: (!is_default).then(|| file.display().to_string()) }.save(&cfg.settings_file)?;
+        if let Ok(mut w) = cfg.startup_warning.lock() {
+            *w = None;
+        }
+        storage_info_of(&store, &cfg)
+    })
+    .await?
+}
+
 // ---------- commands: file system (never on the main thread) ----------
 
 /// Existence, size and date for the given paths. Unreachable shares yield `offline` quickly.
@@ -515,8 +640,26 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let file = app.path().app_data_dir()?.join("spaces.json");
-            app.manage::<AppStore>(Mutex::new(Store::load(file)?));
+            let default_data_file = app.path().app_data_dir()?.join(DATA_FILE);
+            let settings_file = app.path().app_config_dir()?.join("settings.json");
+            let custom = Settings::load(&settings_file)
+                .data_file
+                .map(PathBuf::from)
+                .filter(|f| !same_file(f, &default_data_file));
+            // A custom location that cannot be read (share offline, folder gone, corrupt file)
+            // must not block the app: fall back to the default and say so in the UI.
+            let (store, warning) = match custom {
+                Some(f) => match load_reachable(&f) {
+                    Ok(data) => (Store::new(f.clone(), data), None),
+                    Err(e) => (
+                        Store::load(default_data_file.clone())?,
+                        Some(format!("Datendatei {} konnte nicht geladen werden ({e}). Es wird vorübergehend der Standardspeicherort verwendet.", f.display())),
+                    ),
+                },
+                None => (Store::load(default_data_file.clone())?, None),
+            };
+            app.manage::<AppStore>(Mutex::new(store));
+            app.manage(Config { settings_file, default_data_file, startup_warning: Mutex::new(warning) });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -537,7 +680,10 @@ pub fn run() {
             copy_files,
             copy_paths,
             open_path,
-            reveal_path
+            reveal_path,
+            storage_info,
+            inspect_location,
+            change_location
         ])
         .run(tauri::generate_context!())
         .expect("error while running OneSpace");

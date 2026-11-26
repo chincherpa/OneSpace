@@ -6,7 +6,8 @@ Windows-Desktop-App (Tauri 2): Lege für jedes Projekt einen **Space** an und f�
 
 ## Funktionen
 
-- Spaces anlegen, umbenennen, beschreiben, einfärben, löschen. Beim Löschen werden nur die Verknüpfungen entfernt, nie Dateien.
+- Spaces anlegen, umbenennen (Doppelklick in der Seitenleiste oder Titel im Space), einfärben (Klick auf den Farbpunkt: Palette oder eigene Farbe), löschen. Beim Löschen werden nur die Verknüpfungen entfernt, nie Dateien.
+- Spaces in der Seitenleiste sortieren: alt zuerst, neu zuerst oder nach Name.
 - Dateien/Ordner per **Drag & Drop aus dem Explorer** hinzufügen. Wer auf einen Space in der Seitenleiste zieht, fügt die Elemente direkt dort hinzu. Alternativ geht es über die Dateiauswahl.
 - Jede Verknüpfung zeigt ihren Herkunftsort (Dokumente, Downloads, OneDrive …), Größe und Änderungsdatum.
 - Elemente öffnen (Doppelklick) oder im Explorer anzeigen.
@@ -19,11 +20,15 @@ Windows-Desktop-App (Tauri 2): Lege für jedes Projekt einen **Space** an und f�
 - Ist eine Freigabe nicht erreichbar (VPN aus, NAS im Ruhezustand), zeigt die App **„Offline“** statt „Nicht gefunden“ und friert nicht ein. Alle Dateisystem-Prüfungen laufen im Hintergrund, mit 2 s Timeout pro Freigabe. Das Ergebnis wird 30 s zwischengespeichert.
 - Filtern/Sortieren innerhalb eines Space, Suche über alle Spaces („In welchem Projekt war diese Datei?“). Beides berücksichtigt auch Tags.
 - Doppelte Pfade werden erkannt, unter Windows ohne Beachtung der Groß-/Kleinschreibung.
-- Helles und dunkles Design, je nach Windows-Einstellung.
+- Helles und dunkles Design: Umschalter oben in der Seitenleiste, in den Einstellungen auch „Wie Windows“.
 
 ## Datenhaltung
 
-Alle Spaces liegen als JSON in `%APPDATA%\com.onespace.app\spaces.json`. Gespeichert werden nur Pfade und Metadaten. Das Schreiben ist atomar (temporäre Datei + Rename).
+Alle Spaces liegen als JSON standardmäßig in `%APPDATA%\com.onespace.app\spaces.json`. Gespeichert werden nur Pfade und Metadaten. Das Schreiben ist atomar (temporäre Datei + Rename).
+
+Unter **Einstellungen → Speicherort der Daten** lässt sich ein anderer Ordner wählen (z. B. OneDrive oder ein Netzlaufwerk). Die bisherige Datei bleibt dabei liegen. Liegt am Ziel schon eine `spaces.json`, kann sie übernommen oder überschrieben werden (vorher als `spaces.json.bak` gesichert). Der gewählte Ort steht in `%APPDATA%\com.onespace.app\settings.json`. Ist er beim Start nicht erreichbar, startet die App mit dem Standardort und zeigt einen Hinweis.
+
+Design und Sortierung der Seitenleiste sind reine Ansichtseinstellungen und werden im WebView gespeichert.
 
 ## Entwicklung (Windows)
 

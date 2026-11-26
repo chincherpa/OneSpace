@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, thiserror::Error)]
@@ -86,25 +86,48 @@ pub struct Store {
     pub data: Data,
 }
 
+/// Reads a data file; a missing file yields an empty map.
+pub fn read_data(file: &Path) -> Result<Data> {
+    match fs::read_to_string(file) {
+        Ok(s) => Ok(serde_json::from_str(&s)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Data { version: 1, spaces: vec![] }),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Atomic write: a temp file next to the target, then rename over it.
+pub fn write_data(file: &Path, data: &Data) -> Result<()> {
+    if let Some(dir) = file.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = file.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(data)?)?;
+    fs::rename(&tmp, file)?;
+    Ok(())
+}
+
 impl Store {
     pub fn load(file: PathBuf) -> Result<Self> {
-        let data = match fs::read_to_string(&file) {
-            Ok(s) => serde_json::from_str(&s)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Data { version: 1, spaces: vec![] },
-            Err(e) => return Err(e.into()),
-        };
+        let data = read_data(&file)?;
         Ok(Self { file, data })
     }
 
-    /// Atomic save: write a temp file, then rename over the original.
+    pub fn new(file: PathBuf, data: Data) -> Self {
+        Self { file, data }
+    }
+
     pub fn save(&self) -> Result<()> {
-        if let Some(dir) = self.file.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let tmp = self.file.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&self.data)?)?;
-        fs::rename(&tmp, &self.file)?;
-        Ok(())
+        write_data(&self.file, &self.data)
+    }
+
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// Switches to another data file. `data` is what that file now holds.
+    pub fn relocate(&mut self, file: PathBuf, data: Data) {
+        self.file = file;
+        self.data = data;
     }
 
     pub fn space_mut(&mut self, id: &str) -> Result<&mut Space> {
@@ -113,6 +136,35 @@ impl Store {
 
     pub fn space(&self, id: &str) -> Result<&Space> {
         self.data.spaces.iter().find(|s| s.id == id).ok_or(Error::SpaceNotFound)
+    }
+}
+
+/// App settings, stored separately from the data so the data file can live anywhere.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    /// Custom location of the data file; `None` means the default in the app data folder.
+    #[serde(default)]
+    pub data_file: Option<String>,
+}
+
+impl Settings {
+    /// Missing or unreadable settings fall back to the defaults.
+    pub fn load(file: &Path) -> Self {
+        fs::read_to_string(file)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, file: &Path) -> Result<()> {
+        if let Some(dir) = file.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let tmp = file.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        fs::rename(&tmp, file)?;
+        Ok(())
     }
 }
 
@@ -176,6 +228,18 @@ mod tests {
             "items":[{"id":"i","path":"C:\\x","kind":"file","addedAt":0}]}]}"##;
         let data: Data = serde_json::from_str(json).unwrap();
         assert!(data.spaces[0].items[0].tags.is_empty());
+    }
+
+    #[test]
+    fn settings_roundtrip_and_defaults() {
+        let dir = std::env::temp_dir().join(format!("onespace-test-{}", uuid::Uuid::new_v4()));
+        let file = dir.join("settings.json");
+        assert!(Settings::load(&file).data_file.is_none());
+        Settings { data_file: Some("D:\\Daten\\spaces.json".into()) }.save(&file).unwrap();
+        assert_eq!(Settings::load(&file).data_file.as_deref(), Some("D:\\Daten\\spaces.json"));
+        fs::write(&file, "kaputt").unwrap();
+        assert!(Settings::load(&file).data_file.is_none());
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
