@@ -109,6 +109,8 @@ export const api = {
   spaceHealth: () => invoke<SpaceHealth[]>("space_health"),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
+  /** Opens the (nearest existing) folder of a missing item; reconnects network drives. */
+  openLocation: (path: string) => invoke<void>("open_location", { path }),
   copyFiles: (paths: string[]) => invoke<CopyResult>("copy_files", { paths }),
   copyPaths: (paths: string[]) => invoke<void>("copy_paths", { paths }),
   storageInfo: () => invoke<StorageInfo>("storage_info"),

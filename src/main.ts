@@ -512,7 +512,8 @@ function metaFor(i: ItemView): string {
     case undefined:
       return `<span class="pending" title="Wird geprüft…">…</span>`;
     case "missing":
-      return `<span class="missing-badge">Nicht gefunden</span>`;
+      return `<button class="missing-badge" data-action="locate"
+                title="${i.network ? "Speicherort im Explorer öffnen. Verbindet das Netzlaufwerk, falls getrennt." : "Speicherort im Explorer öffnen"}">${svg("reveal")}Nicht gefunden</button>`;
     case "offline":
       return `<span class="offline-text" title="Die Netzwerkfreigabe antwortet nicht. Die Datei ist vermutlich noch da.">${svg("offline")} Offline</span>`;
     case "ok":
@@ -978,6 +979,8 @@ app.addEventListener("click", async (ev) => {
       return render();
     case "reveal":
       return void guard(api.revealPath(row!.dataset.path!));
+    case "locate":
+      return void guard(api.openLocation(row!.dataset.path!));
     case "edit":
       state.editingItem = row!.dataset.id!;
       render();

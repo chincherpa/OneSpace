@@ -62,11 +62,7 @@ pub fn net_root(path: &str) -> Option<NetRoot> {
 /// Comparison key: mapped drives are resolved to their UNC share and case is ignored,
 /// so `Z:\a.pdf` and `\\server\share\a.pdf` count as the same file.
 pub fn path_key(path: &str) -> String {
-    let p = normalize(path);
-    let p = match net_root(&p) {
-        Some(r) => format!("{}{}", r.unc, &p[r.prefix.len()..]),
-        None => p,
-    };
+    let p = to_unc(path);
     let p = p.trim_end_matches('\\');
     if cfg!(windows) {
         p.to_lowercase()
@@ -75,7 +71,55 @@ pub fn path_key(path: &str) -> String {
     }
 }
 
+/// `Z:\a.pdf` -> `\\server\share\a.pdf` for mapped drives; other paths only normalized.
+pub fn to_unc(path: &str) -> String {
+    let p = normalize(path);
+    match net_root(&p) {
+        Some(r) => format!("{}{}", r.unc, &p[r.prefix.len()..]),
+        None => p,
+    }
+}
+
 // ---------- mapped drives ----------
+
+/// Makes sure the mapped drive `path` is on is actually connected. Windows restores
+/// remembered drives lazily (Explorer shows them with a red X) and connects them only
+/// when Explorer touches them; until then every other program gets "path not found".
+/// Returns false for paths not on a mapped drive and when reconnecting failed
+/// (e.g. because credentials are needed).
+pub fn reconnect_drive(path: &str) -> bool {
+    let Some(r) = net_root(path) else { return false };
+    if r.prefix == r.unc {
+        return false; // plain UNC path, nothing to connect
+    }
+    if fs::metadata(format!("{}\\", r.prefix)).is_ok() {
+        return true;
+    }
+    connect_drive(&r.prefix, &r.unc) && fs::metadata(format!("{}\\", r.prefix)).is_ok()
+}
+
+#[cfg(windows)]
+fn connect_drive(drive: &str, unc: &str) -> bool {
+    use windows_sys::Win32::NetworkManagement::WNet::{WNetAddConnection2W, NETRESOURCEW, RESOURCETYPE_DISK};
+
+    let mut local: Vec<u16> = drive.encode_utf16().chain(Some(0)).collect();
+    let mut remote: Vec<u16> = unc.encode_utf16().chain(Some(0)).collect();
+    let res = NETRESOURCEW {
+        dwType: RESOURCETYPE_DISK,
+        lpLocalName: local.as_mut_ptr(),
+        lpRemoteName: remote.as_mut_ptr(),
+        ..Default::default()
+    };
+    // SAFETY: both strings are NUL-terminated and outlive the call; null password and
+    // user mean "current user / stored credentials". Flags 0: the remembered mapping stays as is.
+    let rc = unsafe { WNetAddConnection2W(&res, std::ptr::null(), std::ptr::null(), 0) };
+    rc == 0
+}
+
+#[cfg(not(windows))]
+fn connect_drive(_: &str, _: &str) -> bool {
+    false
+}
 
 type DriveCache = Mutex<HashMap<String, (Instant, Option<String>)>>;
 
@@ -197,6 +241,37 @@ fn share_online(unc: &str) -> bool {
     online
 }
 
+/// Drops the cached reachability of the share `path` lives on, so the next probe asks again.
+pub fn forget_share(path: &str) {
+    if let Some(r) = net_root(path) {
+        if let Ok(mut c) = share_cache().lock() {
+            c.remove(&r.unc.to_lowercase());
+        }
+    }
+}
+
+/// The deepest existing folder above `path`. If none answers (e.g. a disconnected
+/// mapped drive), the path's own parent folder is returned so the file manager can
+/// reconnect it. Bounded by `SHARE_TIMEOUT`.
+pub fn nearest_folder(path: &str) -> String {
+    let p = normalize(path);
+    let parent = std::path::Path::new(&p)
+        .parent()
+        .map(|d| d.display().to_string())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| p.clone());
+    let (tx, rx) = mpsc::channel();
+    let start = parent.clone();
+    thread::spawn(move || {
+        let found = std::path::Path::new(&start)
+            .ancestors()
+            .find(|d| fs::metadata(d).map(|m| m.is_dir()).unwrap_or(false))
+            .map(|d| d.display().to_string());
+        let _ = tx.send(found);
+    });
+    rx.recv_timeout(SHARE_TIMEOUT).ok().flatten().unwrap_or(parent)
+}
+
 /// Stats all paths, grouped by share and in parallel. Paths on unreachable
 /// shares are reported `Offline` instead of blocking. Never takes much longer
 /// than `TOTAL_TIMEOUT`.
@@ -215,6 +290,17 @@ pub fn probe_all(paths: &[String]) -> Vec<Probe> {
         let tx = tx.clone();
         thread::spawn(move || {
             let online = root.as_deref().map_or(true, share_online);
+            if online && root.is_some() {
+                // The share answers, so a disconnected mapped drive on it only needs reconnecting.
+                let mut drives = std::collections::HashSet::new();
+                for p in &items {
+                    if let Some(r) = net_root(p).filter(|r| r.prefix != r.unc) {
+                        if drives.insert(r.prefix) {
+                            reconnect_drive(p);
+                        }
+                    }
+                }
+            }
             let res = items
                 .iter()
                 .map(|p| if online { stat(p) } else { Probe::without_stat(p, Status::Offline) })
@@ -267,6 +353,14 @@ mod tests {
     }
 
     #[test]
+    fn nearest_folder_walks_up_to_existing_dir() {
+        let dir = std::env::temp_dir();
+        let deep = dir.join("onespace-nope-1").join("nope-2").join("file.pdf");
+        let found = nearest_folder(&deep.display().to_string());
+        assert_eq!(path_key(&found), path_key(&dir.display().to_string()));
+    }
+
+    #[test]
     fn probe_local_and_unreachable_share() {
         let dir = std::env::temp_dir();
         let missing = dir.join("onespace-does-not-exist-42").display().to_string();
@@ -277,3 +371,4 @@ mod tests {
         assert_eq!(res[1].status, Status::Missing);
     }
 }
+

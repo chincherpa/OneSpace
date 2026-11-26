@@ -624,14 +624,37 @@ fn copy_paths(paths: Vec<String>) -> Result<()> {
 
 #[tauri::command]
 async fn open_path(path: String) -> Result<()> {
-    blocking(move || tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| Error::Other(e.to_string())))
-        .await?
+    blocking(move || {
+        net::reconnect_drive(&path);
+        tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| Error::Other(e.to_string()))
+    })
+    .await?
 }
 
 #[tauri::command]
 async fn reveal_path(path: String) -> Result<()> {
-    blocking(move || tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|e| Error::Other(e.to_string())))
-        .await?
+    blocking(move || {
+        net::reconnect_drive(&path);
+        tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|e| Error::Other(e.to_string()))
+    })
+    .await?
+}
+
+/// Opens the folder where a missing item should be in the file manager. A disconnected
+/// mapped drive is reconnected first; if that fails, the share is opened by its UNC path
+/// so Explorer can ask for credentials. The next probe (on window focus) checks again.
+#[tauri::command]
+async fn open_location(path: String) -> Result<()> {
+    blocking(move || {
+        net::forget_share(&path);
+        net::reconnect_drive(&path);
+        let mut dir = net::nearest_folder(&path);
+        if std::fs::metadata(&dir).is_err() {
+            dir = net::to_unc(&dir);
+        }
+        tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(|e| Error::Other(e.to_string()))
+    })
+    .await?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -681,6 +704,7 @@ pub fn run() {
             copy_paths,
             open_path,
             reveal_path,
+            open_location,
             storage_info,
             inspect_location,
             change_location

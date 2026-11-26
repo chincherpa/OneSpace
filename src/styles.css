@@ -185,7 +185,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .parent { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 .item-note { font-size: 12.5px; margin-top: 4px; white-space: pre-wrap; }
 .item-meta { color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }
-.missing-badge { color: var(--warn); font-weight: 600; }
+.missing-badge {
+  color: var(--warn); font: inherit; font-weight: 600; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 4px;
+  background: none; border: 1px solid transparent; border-radius: 4px; padding: 1px 6px;
+}
+.missing-badge:hover { background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+.missing-badge svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .offline-text { color: var(--muted); font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
 .offline-text svg, .offline-badge svg, .loc svg {
   width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
