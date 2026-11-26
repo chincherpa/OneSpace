@@ -699,7 +699,7 @@ function renderSettings(): string {
     ["dark", "Dunkel"],
   ] as const;
   return `
-    <header class="space-header"><h1 class="space-title static">EinstellungenYYYYYY</h1></header>
+    <header class="space-header"><h1 class="space-title static">Settings</h1></header>
     <section class="settings-card">
       <h2>Darstellung</h2>
       <div class="segmented" role="radiogroup" aria-label="Design">
