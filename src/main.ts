@@ -411,10 +411,9 @@ function renderSidebar(): string {
       <div class="sidebar-footer">
         <button class="space-link nav ${state.settings ? "active" : ""}" data-action="settings">
           ${svg("gear")}
-          <span class="space-name">Einstellungen</span>
+          <span class="space-name">Settings</span>
           ${state.storage?.warning ? `<span class="warn" title="Speicherort prüfen">!</span>` : ""}
         </button>
-        <p class="tagline">Speichert die Karte, nicht die Dateien.</p>
       </div>
     </aside>`;
 }
@@ -700,7 +699,7 @@ function renderSettings(): string {
     ["dark", "Dunkel"],
   ] as const;
   return `
-    <header class="space-header"><h1 class="space-title static">Einstellungen</h1></header>
+    <header class="space-header"><h1 class="space-title static">EinstellungenYYYYYY</h1></header>
     <section class="settings-card">
       <h2>Darstellung</h2>
       <div class="segmented" role="radiogroup" aria-label="Design">
