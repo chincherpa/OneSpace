@@ -6,6 +6,7 @@ export interface SpaceSummary {
   id: string;
   name: string;
   color: string;
+  createdAt: number;
   itemCount: number;
 }
 
@@ -74,6 +75,20 @@ export interface CopyResult {
   offline: number;
 }
 
+export interface StorageInfo {
+  path: string;
+  defaultPath: string;
+  isDefault: boolean;
+  warning: string | null;
+}
+
+export interface LocationCheck {
+  path: string;
+  exists: boolean;
+  spaces: number | null;
+  error: string | null;
+}
+
 export const api = {
   listSpaces: () => invoke<SpaceSummary[]>("list_spaces"),
   getSpace: (id: string) => invoke<SpaceView>("get_space", { id }),
@@ -96,4 +111,9 @@ export const api = {
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   copyFiles: (paths: string[]) => invoke<CopyResult>("copy_files", { paths }),
   copyPaths: (paths: string[]) => invoke<void>("copy_paths", { paths }),
+  storageInfo: () => invoke<StorageInfo>("storage_info"),
+  /** `dir: null` = default location. */
+  inspectLocation: (dir: string | null) => invoke<LocationCheck>("inspect_location", { dir }),
+  changeLocation: (dir: string | null, useExisting: boolean) =>
+    invoke<StorageInfo>("change_location", { dir, useExisting }),
 };

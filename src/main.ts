@@ -8,18 +8,62 @@ import {
   type SpaceHealth,
   type SpaceSummary,
   type SpaceView,
+  type StorageInfo,
   type TagCount,
 } from "./api";
 
-const COLORS = ["#4f7cff", "#16a37f", "#e2683c", "#a35bd6", "#d4a017", "#d6457a", "#2e9bc4", "#6b7a8f"];
+const COLORS = [
+  "#4f7cff", "#2e9bc4", "#16a37f", "#5f9e2f", "#d4a017", "#e2683c",
+  "#d6453d", "#d6457a", "#a35bd6", "#6d5bd6", "#8a6d3b", "#6b7a8f",
+];
 
 type SortKey = "added" | "name" | "location" | "modified";
+type SpaceSort = "oldest" | "newest" | "name";
+type Theme = "system" | "light" | "dark";
+
+// ---------- per-user preferences (UI only; the data file holds the spaces) ----------
+
+function pref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const v = localStorage.getItem(`onespace.${key}`) as T | null;
+    return v && allowed.includes(v) ? v : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function savePref(key: string, value: string) {
+  try {
+    localStorage.setItem(`onespace.${key}`, value);
+  } catch {
+    /* storage unavailable: preference lasts for this session only */
+  }
+}
+
+const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+function applyTheme(theme: Theme) {
+  if (theme === "system") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = theme;
+}
+
+const isDark = () => (state.theme === "system" ? darkQuery.matches : state.theme === "dark");
 
 const state = {
   spaces: [] as SpaceSummary[],
   current: null as SpaceView | null,
   filter: "",
   sort: "added" as SortKey,
+  spaceSort: pref<SpaceSort>("spaceSort", ["oldest", "newest", "name"], "oldest"),
+  theme: pref<Theme>("theme", ["system", "light", "dark"], "system"),
+  /** Main area shows the settings page. */
+  settings: false,
+  storage: null as StorageInfo | null,
+  /** Space whose color popover is open; "header" variant is keyed by `colorPickerAt`. */
+  colorPicker: null as string | null,
+  colorPickerAt: "sidebar" as "sidebar" | "header",
+  /** Space being renamed inline in the sidebar. */
+  renaming: null as string | null,
   globalQuery: "",
   hits: [] as SearchHit[],
   /** Dashboard: all tags, the chosen one and the items carrying it. */
@@ -83,7 +127,7 @@ function iconFor(item: ItemView): string {
 }
 
 let toastTimer: number | undefined;
-function toast(msg: string, kind: "ok" | "err" = "ok") {
+function toast(msg: string, kind: "ok" | "err" = "ok", ms = 3200) {
   let el = document.getElementById("toast");
   if (!el) {
     el = document.createElement("div");
@@ -93,7 +137,7 @@ function toast(msg: string, kind: "ok" | "err" = "ok") {
   el.className = `toast show ${kind}`;
   el.textContent = msg;
   clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => el!.classList.remove("show"), 3200);
+  toastTimer = window.setTimeout(() => el!.classList.remove("show"), ms);
 }
 
 async function guard<T>(p: Promise<T>): Promise<T | undefined> {
@@ -129,6 +173,7 @@ async function loadTags() {
 /** Opens the dashboard, optionally with a tag selected. */
 async function showDashboard(tag: string | null = state.activeTag) {
   state.current = null;
+  state.settings = false;
   state.globalQuery = "";
   state.hits = [];
   state.filter = "";
@@ -170,6 +215,7 @@ async function loadHealth() {
 
 async function selectSpace(id: string) {
   state.current = (await guard(api.getSpace(id))) ?? null;
+  state.settings = false;
   state.filter = "";
   state.editingItem = null;
   state.selected.clear();
@@ -270,19 +316,56 @@ function healthBadges(h: SpaceHealth | undefined): string {
   );
 }
 
+function sortedSpaces(): SpaceSummary[] {
+  const list = [...state.spaces];
+  switch (state.spaceSort) {
+    case "name":
+      return list.sort((a, b) => a.name.localeCompare(b.name, "de", { sensitivity: "base" }));
+    case "newest":
+      return list.sort((a, b) => b.createdAt - a.createdAt);
+    case "oldest":
+      return list.sort((a, b) => a.createdAt - b.createdAt);
+  }
+}
+
+function colorPopover(id: string, current: string): string {
+  const custom = COLORS.includes(current.toLowerCase()) ? "" : current;
+  return `
+    <div class="color-popover" role="dialog" aria-label="Farbe wählen" data-space="${id}">
+      <div class="swatches">
+        ${COLORS.map(
+          (c) => `<button class="swatch ${c === current.toLowerCase() ? "active" : ""}" data-action="set-color" data-color="${c}"
+                          style="background:${c}" title="${c}"></button>`,
+        ).join("")}
+      </div>
+      <label class="custom-color">
+        <input type="color" id="custom-color" value="${esc(/^#[0-9a-f]{6}$/i.test(current) ? current : "#4f7cff")}" />
+        <span>Eigene Farbe${custom ? ` <code>${esc(custom)}</code>` : ""}</span>
+      </label>
+    </div>`;
+}
+
 function renderSidebar(): string {
-  const items = state.spaces
-    .map(
-      (s) => `
-      <li>
-        <button class="space-link ${state.current?.id === s.id ? "active" : ""} ${state.dropTarget === s.id ? "drop" : ""}"
-                data-action="select" data-id="${s.id}" data-drop-space="${s.id}">
-          <span class="dot" style="background:${esc(s.color)}"></span>
-          <span class="space-name">${esc(s.name)}</span>
-          ${healthBadges(state.health.get(s.id))}
-          <span class="count">${s.itemCount}</span>
-        </button>
-      </li>`,
+  const items = sortedSpaces()
+    .map((s) =>
+      state.renaming === s.id
+        ? `<li>
+             <form id="rename-form" class="rename-form" data-id="${s.id}">
+               <span class="dot" style="background:${esc(s.color)}"></span>
+               <input id="rename-input" value="${esc(s.name)}" maxlength="80" autocomplete="off" aria-label="Neuer Name" />
+             </form>
+           </li>`
+        : `<li class="${state.colorPicker === s.id && state.colorPickerAt === "sidebar" ? "picking" : ""}">
+             <button class="space-link ${state.current?.id === s.id && !state.settings ? "active" : ""} ${state.dropTarget === s.id ? "drop" : ""}"
+                     data-action="select" data-id="${s.id}" data-drop-space="${s.id}" title="Doppelklick zum Umbenennen">
+               <span class="dot pick" data-action="pick-color" data-id="${s.id}" data-at="sidebar" title="Farbe ändern"
+                     style="background:${esc(s.color)}"></span>
+               <span class="space-name">${esc(s.name)}</span>
+               ${healthBadges(state.health.get(s.id))}
+               <span class="count">${s.itemCount}</span>
+             </button>
+             ${state.colorPicker === s.id && state.colorPickerAt === "sidebar" ? colorPopover(s.id, s.color) : ""}
+           </li>`,
     )
     .join("");
   return `
@@ -290,14 +373,33 @@ function renderSidebar(): string {
       <div class="brand">
         <img src="/app-icon.svg" alt="" width="22" height="22" />
         <span>OneSpace</span>
+        <button class="icon-btn theme-toggle" data-action="toggle-theme"
+                title="${isDark() ? "Helles Design" : "Dunkles Design"}">${svg(isDark() ? "sun" : "moon")}</button>
       </div>
       <input class="search" id="global-search" type="search" placeholder="In allen Spaces suchen…" value="${esc(state.globalQuery)}" />
-      <button class="space-link nav ${!state.current && !state.globalQuery ? "active" : ""}" data-action="dashboard">
+      <button class="space-link nav ${!state.current && !state.globalQuery && !state.settings ? "active" : ""}" data-action="dashboard">
         ${svg("grid")}
         <span class="space-name">Dashboard</span>
         ${state.tags.length ? `<span class="count" title="Tags">${state.tags.length}</span>` : ""}
       </button>
-      <div class="section-label">Spaces</div>
+      <div class="section-label">
+        <span>Spaces</span>
+        ${
+          state.spaces.length > 1
+            ? `<select id="space-sort" class="mini-select" aria-label="Spaces sortieren" title="Spaces sortieren">
+                 ${(
+                   [
+                     ["oldest", "Alt zuerst"],
+                     ["newest", "Neu zuerst"],
+                     ["name", "Name A–Z"],
+                   ] as const
+                 )
+                   .map(([k, l]) => `<option value="${k}" ${state.spaceSort === k ? "selected" : ""}>${l}</option>`)
+                   .join("")}
+               </select>`
+            : ""
+        }
+      </div>
       <ul class="space-list">${items}</ul>
       ${
         state.creating
@@ -306,7 +408,14 @@ function renderSidebar(): string {
              </form>`
           : `<button class="new-space" data-action="new-space">+ Neuer Space</button>`
       }
-      <p class="tagline">Speichert die Karte, nicht die Dateien.</p>
+      <div class="sidebar-footer">
+        <button class="space-link nav ${state.settings ? "active" : ""}" data-action="settings">
+          ${svg("gear")}
+          <span class="space-name">Einstellungen</span>
+          ${state.storage?.warning ? `<span class="warn" title="Speicherort prüfen">!</span>` : ""}
+        </button>
+        <p class="tagline">Speichert die Karte, nicht die Dateien.</p>
+      </div>
     </aside>`;
 }
 
@@ -416,7 +525,9 @@ function metaFor(i: ItemView): string {
   }
 }
 
-type IconName = "open" | "reveal" | "edit" | "remove" | "trash" | "copy" | "path" | "network" | "offline" | "grid" | "tag";
+type IconName =
+  | "open" | "reveal" | "edit" | "remove" | "trash" | "copy" | "path" | "network" | "offline" | "grid" | "tag"
+  | "sun" | "moon" | "gear" | "folder";
 
 function svg(name: IconName): string {
   const paths = {
@@ -431,6 +542,10 @@ function svg(name: IconName): string {
     trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
     grid: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
     tag: "M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9zM7.5 7.5h.01",
+    sun: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4",
+    moon: "M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5z",
+    gear: "M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM19.4 13a7.6 7.6 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.4 7.4 0 0 0-1.7-1L15 3.5h-4l-.4 2.5a7.4 7.4 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.4 7.4 0 0 0 1.7 1l.4 2.5h4l.4-2.5a7.4 7.4 0 0 0 1.7-1l2.4 1 2-3.4z",
+    folder: "M3 6.5A1.5 1.5 0 0 1 4.5 5h4.6l2 2h8.4A1.5 1.5 0 0 1 21 8.5v9A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5z",
   };
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[name]}"/></svg>`;
 }
@@ -472,7 +587,10 @@ function renderSpace(s: SpaceView): string {
   const locations = [...new Set(s.items.map((i) => i.location))];
   return `
     <header class="space-header">
-      <button class="color-dot" data-action="cycle-color" title="Farbe ändern" style="background:${esc(s.color)}"></button>
+      <div class="color-anchor">
+        <button class="color-dot" data-action="pick-color" data-id="${s.id}" data-at="header" title="Farbe ändern" style="background:${esc(s.color)}"></button>
+        ${state.colorPicker === s.id && state.colorPickerAt === "header" ? colorPopover(s.id, s.color) : ""}
+      </div>
       <input class="space-title" id="space-title" value="${esc(s.name)}" maxlength="80" aria-label="Name des Space" />
       <div class="header-actions">
         <button class="btn" data-action="add-files">Dateien verknüpfen</button>
@@ -480,7 +598,6 @@ function renderSpace(s: SpaceView): string {
         <button class="icon-btn danger" data-action="delete-space" title="Space löschen">${svg("trash")}</button>
       </div>
     </header>
-    <textarea class="space-desc" id="space-desc" rows="1" placeholder="Worum geht es in diesem Projekt?">${esc(s.description)}</textarea>
     <div class="stats">
       <span>${s.items.length} Verknüpfung${s.items.length === 1 ? "" : "en"}</span>
       ${locations.length ? `<span>aus ${locations.map(esc).join(", ")}</span>` : ""}
@@ -575,7 +692,52 @@ function renderDashboard(): string {
     }`;
 }
 
+function renderSettings(): string {
+  const info = state.storage;
+  const themes = [
+    ["system", "Wie Windows"],
+    ["light", "Hell"],
+    ["dark", "Dunkel"],
+  ] as const;
+  return `
+    <header class="space-header"><h1 class="space-title static">Einstellungen</h1></header>
+    <section class="settings-card">
+      <h2>Darstellung</h2>
+      <div class="segmented" role="radiogroup" aria-label="Design">
+        ${themes
+          .map(
+            ([k, l]) => `<button role="radio" aria-checked="${state.theme === k}" class="${state.theme === k ? "active" : ""}"
+                                 data-action="set-theme" data-theme="${k}">${l}</button>`,
+          )
+          .join("")}
+      </div>
+    </section>
+    <section class="settings-card">
+      <h2>Speicherort der Daten</h2>
+      <p class="hint">In dieser Datei stehen alle Spaces, Verknüpfungen, Notizen und Tags, nicht die Dateien selbst.
+         Lege sie zum Beispiel in einen OneDrive- oder Netzwerkordner, um sie zu sichern.</p>
+      ${info?.warning ? `<div class="notice warn-box">${esc(info.warning)}</div>` : ""}
+      ${
+        info
+          ? `<div class="path-box">
+               ${svg("folder")}
+               <code title="${esc(info.path)}">${esc(info.path)}</code>
+               ${info.isDefault ? `<span class="badge">Standard</span>` : ""}
+             </div>
+             <div class="row">
+               <button class="btn primary" data-action="choose-location">Anderen Ordner wählen…</button>
+               <button class="btn" data-action="reveal-data">Im Explorer zeigen</button>
+               ${info.isDefault ? "" : `<button class="btn" data-action="reset-location">Standard wiederherstellen</button>`}
+             </div>
+             <p class="hint small">Beim Wechsel bleibt die bisherige Datei unverändert liegen. Liegt am Ziel schon eine
+                OneSpace-Datei, kannst du sie übernehmen oder (mit Sicherung als <code>spaces.json.bak</code>) überschreiben.</p>`
+          : `<p class="hint">Wird geladen…</p>`
+      }
+    </section>`;
+}
+
 function renderMain(): string {
+  if (state.settings) return renderSettings();
   if (state.globalQuery) return renderSearch();
   if (state.current) return renderSpace(state.current);
   if (state.spaces.length) return renderDashboard();
@@ -616,20 +778,92 @@ function render() {
       if (selStart != null && "setSelectionRange" in el) el.setSelectionRange(selStart, selStart);
     }
   }
-  const desc = document.getElementById("space-desc") as HTMLTextAreaElement | null;
-  if (desc) autosize(desc);
   if (state.creating) document.getElementById("create-name")?.focus();
+  const rename = document.getElementById("rename-input") as HTMLInputElement | null;
+  if (rename && document.activeElement !== rename) {
+    rename.focus();
+    rename.select();
+  }
 }
 
-function autosize(t: HTMLTextAreaElement) {
-  t.style.height = "auto";
-  t.style.height = `${t.scrollHeight}px`;
+// ---------- actions: spaces, theme, storage ----------
+
+async function setSpaceColor(id: string, color: string) {
+  await guard(api.updateSpace(id, { color }));
+  await refresh();
+}
+
+async function renameSpace(id: string, name: string) {
+  state.renaming = null;
+  const old = state.spaces.find((s) => s.id === id);
+  if (!name.trim() || name.trim() === old?.name) return render();
+  await guard(api.updateSpace(id, { name }));
+  await refresh();
+}
+
+function setTheme(theme: Theme) {
+  state.theme = theme;
+  savePref("theme", theme);
+  applyTheme(theme);
+  render();
+}
+
+async function loadStorage() {
+  state.storage = (await guard(api.storageInfo())) ?? null;
+}
+
+/** Switches the data file to `dir` (null = default), asking what to do with a file already there. */
+async function changeLocation(dir: string | null) {
+  const check = await guard(api.inspectLocation(dir));
+  if (!check) return;
+  if (state.storage && check.path.toLowerCase() === state.storage.path.toLowerCase()) {
+    return toast("Die Daten liegen bereits dort.");
+  }
+  let useExisting = false;
+  if (check.exists && check.error) {
+    const ok = await ask(
+      `Am Ziel liegt bereits eine Datei, die sich nicht lesen lässt:\n${check.error}\n\nMit deinen aktuellen Daten überschreiben? Die alte Datei wird als spaces.json.bak gesichert.`,
+      { title: "Speicherort ändern", kind: "warning", okLabel: "Überschreiben", cancelLabel: "Abbrechen" },
+    );
+    if (!ok) return;
+  } else if (check.exists) {
+    const n = check.spaces ?? 0;
+    useExisting = await ask(
+      `In diesem Ordner liegt bereits eine OneSpace-Datei mit ${n} Space${n === 1 ? "" : "s"}.\n\nSoll OneSpace diese Datei verwenden? Deine bisherigen Daten bleiben in der alten Datei erhalten.`,
+      { title: "Speicherort ändern", kind: "info", okLabel: "Vorhandene verwenden", cancelLabel: "Nicht verwenden" },
+    );
+    if (!useExisting) {
+      const ok = await ask(
+        `Die vorhandene Datei mit deinen aktuellen ${state.spaces.length} Spaces überschreiben? Sie wird vorher als spaces.json.bak gesichert.`,
+        { title: "Speicherort ändern", kind: "warning", okLabel: "Überschreiben", cancelLabel: "Abbrechen" },
+      );
+      if (!ok) return;
+    }
+  }
+  const info = await guard(api.changeLocation(dir, useExisting));
+  if (!info) return;
+  state.storage = info;
+  if (useExisting) {
+    state.current = null;
+    state.activeTag = null;
+    state.selected.clear();
+  }
+  toast(useExisting ? "Vorhandene Datei wird jetzt verwendet." : "Daten am neuen Ort gespeichert.");
+  await refresh();
 }
 
 // ---------- events ----------
 
+let lastSelect = { id: "", at: 0 };
+
 app.addEventListener("click", async (ev) => {
-  const btn = (ev.target as HTMLElement).closest<HTMLElement>("[data-action]");
+  const target = ev.target as HTMLElement;
+  if (state.colorPicker && !target.closest(".color-popover, [data-action='pick-color']")) {
+    state.colorPicker = null;
+    render();
+    if (!target.closest("[data-action]")) return;
+  }
+  const btn = target.closest<HTMLElement>("[data-action]");
   if (!btn) {
     const row = (ev.target as HTMLElement).closest<HTMLElement>(".item.selectable");
     if (row && !(ev.target as HTMLElement).closest("input, textarea, form")) selectRow(row.dataset.id!, ev);
@@ -642,8 +876,54 @@ app.addEventListener("click", async (ev) => {
   const rowSpace = row?.dataset.space;
 
   switch (action) {
-    case "select":
-      return selectSpace(btn.dataset.id!);
+    case "select": {
+      // Second click on the same space within a short time: rename inline.
+      const id = btn.dataset.id!;
+      const now = Date.now();
+      const again = lastSelect.id === id && now - lastSelect.at < 450;
+      lastSelect = { id, at: again ? 0 : now };
+      if (again) {
+        state.renaming = id;
+        return render();
+      }
+      return state.current?.id === id && !state.settings ? undefined : selectSpace(id);
+    }
+    case "pick-color": {
+      ev.stopPropagation();
+      const id = btn.dataset.id!;
+      const at = (btn.dataset.at ?? "sidebar") as "sidebar" | "header";
+      const same = state.colorPicker === id && state.colorPickerAt === at;
+      state.colorPicker = same ? null : id;
+      state.colorPickerAt = at;
+      return render();
+    }
+    case "set-color": {
+      const id = btn.closest<HTMLElement>(".color-popover")!.dataset.space!;
+      state.colorPicker = null;
+      return setSpaceColor(id, btn.dataset.color!);
+    }
+    case "toggle-theme":
+      return setTheme(isDark() ? "light" : "dark");
+    case "set-theme":
+      return setTheme(btn.dataset.theme as Theme);
+    case "settings":
+      state.settings = true;
+      state.globalQuery = "";
+      state.hits = [];
+      state.selected.clear();
+      state.editingItem = null;
+      render();
+      return loadStorage().then(render);
+    case "choose-location": {
+      const dir = await open({ directory: true, multiple: false, title: "Ordner für die OneSpace-Daten wählen" });
+      if (typeof dir !== "string") return;
+      return changeLocation(dir);
+    }
+    case "reset-location":
+      return changeLocation(null);
+    case "reveal-data":
+      if (state.storage) await guard(api.revealPath(state.storage.path));
+      return;
     case "dashboard":
       return showDashboard();
     case "toggle-tag": {
@@ -670,12 +950,6 @@ app.addEventListener("click", async (ev) => {
       return pickAndAdd(false);
     case "add-folder":
       return pickAndAdd(true);
-    case "cycle-color": {
-      if (!s) return;
-      const next = COLORS[(COLORS.indexOf(s.color) + 1) % COLORS.length];
-      await guard(api.updateSpace(s.id, { color: next }));
-      return refresh();
-    }
     case "delete-space": {
       if (!s) return;
       const ok = await ask(
@@ -738,7 +1012,9 @@ app.addEventListener("dblclick", (ev) => {
 app.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const form = ev.target as HTMLFormElement;
-  if (form.id === "create-form") {
+  if (form.id === "rename-form") {
+    await renameSpace(form.dataset.id!, (document.getElementById("rename-input") as HTMLInputElement).value);
+  } else if (form.id === "create-form") {
     const name = (document.getElementById("create-name") as HTMLInputElement).value;
     state.creating = false;
     if (!name.trim()) return render();
@@ -774,8 +1050,6 @@ app.addEventListener("input", (ev) => {
       state.hits = state.globalQuery ? ((await guard(api.search(state.globalQuery))) ?? []) : [];
       render();
     }, 150);
-  } else if (t.id === "space-desc") {
-    autosize(t as unknown as HTMLTextAreaElement);
   }
 });
 
@@ -785,12 +1059,17 @@ app.addEventListener("change", async (ev) => {
   if (t.id === "sort") {
     state.sort = t.value as SortKey;
     render();
+  } else if (t.id === "space-sort") {
+    state.spaceSort = t.value as SpaceSort;
+    savePref("spaceSort", state.spaceSort);
+    render();
+  } else if (t.id === "custom-color") {
+    const id = t.closest<HTMLElement>(".color-popover")?.dataset.space;
+    state.colorPicker = null;
+    if (id) await setSpaceColor(id, t.value);
   } else if (t.id === "space-title" && s && t.value.trim() && t.value !== s.name) {
     await guard(api.updateSpace(s.id, { name: t.value }));
     await refresh();
-  } else if (t.id === "space-desc" && s && t.value !== s.description) {
-    await guard(api.updateSpace(s.id, { description: t.value }));
-    s.description = t.value;
   }
 });
 
@@ -808,7 +1087,7 @@ document.addEventListener("keydown", (ev) => {
     ev.preventDefault();
     items.forEach((i) => state.selected.add(i.id));
     render();
-  } else if (ev.key === "Escape" && state.selected.size && !state.creating && !state.editingItem) {
+  } else if (ev.key === "Escape" && state.selected.size && !state.creating && !state.editingItem && !state.colorPicker) {
     state.selected.clear();
     render();
   }
@@ -817,7 +1096,13 @@ document.addEventListener("keydown", (ev) => {
 app.addEventListener("keydown", (ev) => {
   const t = ev.target as HTMLElement;
   if (ev.key === "Escape") {
-    if (state.creating) {
+    if (state.colorPicker) {
+      state.colorPicker = null;
+      render();
+    } else if (state.renaming) {
+      state.renaming = null;
+      render();
+    } else if (state.creating) {
       state.creating = false;
       render();
     } else if (state.editingItem) {
@@ -831,6 +1116,10 @@ app.addEventListener("keydown", (ev) => {
 
 app.addEventListener("focusout", (ev) => {
   const t = ev.target as HTMLElement;
+  if (t.id === "rename-input" && state.renaming) {
+    void renameSpace(state.renaming, (t as HTMLInputElement).value);
+    return;
+  }
   if (t.id === "create-name" && state.creating) {
     // Submit on blur if something was typed, otherwise cancel.
     const v = (t as HTMLInputElement).value;
@@ -875,5 +1164,11 @@ void getCurrentWebview().onDragDropEvent(async (ev) => {
 // Re-check file existence when the window regains focus (files may have moved meanwhile).
 window.addEventListener("focus", () => void refresh());
 
-// Start on the dashboard.
-void refresh();
+applyTheme(state.theme);
+darkQuery.addEventListener("change", () => state.theme === "system" && render());
+
+// Start on the dashboard. A data file that could not be loaded is reported once.
+void loadStorage().then(() => {
+  if (state.storage?.warning) toast(state.storage.warning, "err", 9000);
+  return refresh();
+});
